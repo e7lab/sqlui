@@ -1,0 +1,8 @@
+sqlui-build	sqlui.txt	/*sqlui-build*
+sqlui-cmds	sqlui.txt	/*sqlui-cmds*
+sqlui-contents	sqlui.txt	/*sqlui-contents*
+sqlui-health	sqlui.txt	/*sqlui-health*
+sqlui-install	sqlui.txt	/*sqlui-install*
+sqlui-intro	sqlui.txt	/*sqlui-intro*
+sqlui-setup	sqlui.txt	/*sqlui-setup*
+sqlui.txt	sqlui.txt	/*sqlui.txt*

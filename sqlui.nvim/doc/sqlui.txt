@@ -1,0 +1,115 @@
+*sqlui.txt*   sqlui.nvim
+
+sqlui.nvim is a standalone SQL workflow plugin scaffold for Neovim.
+
+==============================================================================
+CONTENTS                                                  *sqlui-contents*
+
+1. Introduction .............................................. |sqlui-intro|
+2. Installation ............................................. |sqlui-install|
+3. Commands ................................................. |sqlui-cmds|
+4. Setup .................................................... |sqlui-setup|
+5. Current Build ............................................ |sqlui-build|
+6. Health .................................................. |sqlui-health|
+
+==============================================================================
+INTRODUCTION                                                  *sqlui-intro*
+
+sqlui.nvim is the standalone extraction target for a personal SQL workflow
+built around usql, sqls, cache-aware browsing, and optional Telescope UI.
+
+The current repository state is an early scaffold intended to stabilize the
+public API and file layout before migrating all runtime behavior.
+
+============================================================================== 
+INSTALLATION                                                 *sqlui-install*
+
+Example with lazy.nvim:
+
+>
+    {
+      dir = vim.fn.stdpath("config") .. "/sqlui.nvim",
+      name = "sqlui.nvim",
+      lazy = false,
+      config = function()
+        require("sqlui").setup({
+          ui = { picker = "auto" },
+          secrets = { backend = "auto" },
+          usql = { bin = "usql" },
+        })
+      end,
+    }
+<
+
+==============================================================================
+COMMANDS                                                         *sqlui-cmds*
+
+    :SqlUiMenu
+    :SqlUiRun
+    :SqlUiRunSelection
+    :SqlUiRunLastConnection
+    :SqlUiSelectConnection
+    :SqlUiBrowser
+    :SqlUiViewData [schema.table]
+    :SqlUiHistory
+    :SqlUiExportCsv
+    :SqlUiExportXlsx
+    :SqlUiBuildCache
+    :SqlUiClearCache
+    :SqlUiHelp
+
+Use |:checkhealth| sqlui for environment diagnostics.
+
+==============================================================================
+SETUP                                                           *sqlui-setup*
+
+Example:
+
+>
+    require("sqlui").setup({
+      ui = { picker = "auto" },
+      secrets = { backend = "auto" },
+    })
+<
+
+============================================================================== 
+CURRENT BUILD                                                   *sqlui-build*
+
+Already available:
+
+- connection selection
+- current buffer execution
+- visual selection execution
+- run on last connection
+- history
+- CSV export
+- XLSX export
+- schema browser
+- persistent schema cache build/clear
+- lazy column cache by default, with optional eager preload
+- table/view data viewer
+- cached completion source
+- sqls connection sync
+
+Still being migrated:
+
+- richer help actions
+- broader Linux backend support
+
+==============================================================================
+HEALTH                                                         *sqlui-health*
+
+Run:
+
+>
+    :checkhealth sqlui
+<
+
+This checks:
+- usql
+- python3
+- detected secret backend
+- optional sqls
+
+==============================================================================
+vim:tw=78:ts=8:noet:ft=help:norl:
