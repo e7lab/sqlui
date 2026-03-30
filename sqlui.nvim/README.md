@@ -1,54 +1,30 @@
 # sqlui.nvim
 
-`sqlui.nvim` is a Neovim plugin scaffold for SQL workflows built around `usql`, optional `sqls`, cache-aware browsing, and portable connection storage.
+A Neovim plugin for SQL workflows. Execute queries, browse schemas, view data, export results, and manage connections — all from inside Neovim.
 
-This repository is the standalone extraction target for the SQL workflow currently used in the author's personal Neovim configuration.
+Built around [`usql`](https://github.com/xo/usql) with optional [`sqls`](https://github.com/sqls-server/sqls) LSP integration.
 
-## Status
+## Features
 
-Active extraction build.
+- **Multi-driver** — MSSQL, PostgreSQL, MySQL out of the box
+- **Query execution** — run current buffer, visual selection, or last connection
+- **Schema browser** — Telescope-powered browsable tree of tables, views, functions, procedures
+- **Data viewer** — paginated table viewer with filters, column sorting, page size selector, fixed header
+- **Persistent cache** — incremental schema cache with column metadata for fast browsing and completion
+- **Completion** — `nvim-cmp` source powered by cached schema (tables, views, functions, procedures)
+- **Export** — CSV and XLSX export of query results
+- **Connection management** — save, edit, rename, duplicate, delete connections with schema picker
+- **Secure storage** — macOS Keychain, Linux `secret-tool`, KWallet, or file fallback
+- **Lualine integration** — shows active `alias/schema` in the statusline
+- **Cross-platform** — macOS and Linux
 
-Already implemented in the standalone plugin:
+## Requirements
 
-- core setup and public commands
-- connection selection and secure backend resolution
-- current buffer execution with `usql`
-- visual selection execution
-- run with last connection
-- persistent history
-- CSV export
-- XLSX export
-- schema browser with Telescope fallback to native UI
-- table/view data viewer with pagination and filter support
-- persistent schema cache with build/clear commands
-- lazy column cache by default, with optional eager preload
-- cached completion source for `nvim-cmp`
-- `sqls` connection sync managed by the plugin
-- healthcheck scaffold
-
-Still being migrated:
-
-- richer help picker/actions
-- broader Linux secret backend behavior
-- automated tests and CI
-
-## Planned Features
-
-- Connection management with secure secret backends
-- Query execution with `usql`
-- CSV and XLSX export
-- Optional `sqls` integration
-- Schema browser with cache support
-- Cached completion source
-- Telescope UI with native fallback
-- Cross-platform support for macOS and Linux
-
-## Repo Layout
-
-- `lua/sqlui/` - core plugin modules
-- `plugin/sqlui.lua` - Ex commands
-- `doc/sqlui.txt` - `:help sqlui`
-- `tests/` - smoke and future regression tests
+- Neovim >= 0.9
+- [`usql`](https://github.com/xo/usql) — universal SQL CLI
+- [`telescope.nvim`](https://github.com/nvim-telescope/telescope.nvim) (recommended, native `vim.ui.select` fallback available)
+- [`nvim-cmp`](https://github.com/hrsh7th/nvim-cmp) (optional, for schema completion)
+- [`sqls`](https://github.com/sqls-server/sqls) (optional, for LSP features)
 
 ## Installation
 
@@ -56,7 +32,7 @@ Still being migrated:
 
 ```lua
 {
-  dir = vim.fn.stdpath("config") .. "/sqlui.nvim",
+  "e7lab/sqlui",
   name = "sqlui.nvim",
   lazy = false,
   config = function()
@@ -66,105 +42,168 @@ Still being migrated:
       usql = { bin = "usql" },
     })
   end,
+  keys = {
+    { "<leader>ss", function() require("sqlui").menu() end, desc = "SQL menu" },
+    { "<leader>ss", function() require("sqlui").menu_selection_from_visual() end, mode = "x", desc = "SQL menu (selection)" },
+    { "<leader>sr", function() require("sqlui").run_last_connection() end, desc = "Run SQL (last connection)" },
+    { "<leader>sr", function() require("sqlui").run_last_connection_selection_from_visual() end, mode = "x", desc = "Run SQL selection (last connection)" },
+    { "<leader>se", function() require("sqlui").export_csv() end, desc = "Export to CSV" },
+    { "<leader>se", function() require("sqlui").export_csv_selection_from_visual() end, mode = "x", desc = "Export selection to CSV" },
+    { "<leader>sx", function() require("sqlui").export_xlsx() end, desc = "Export to XLSX" },
+    { "<leader>sx", function() require("sqlui").export_xlsx_selection_from_visual() end, mode = "x", desc = "Export selection to XLSX" },
+    { "<leader>sl", function() require("sqlui").select_connection() end, desc = "Select connection" },
+    { "<leader>sb", function() require("sqlui").select_connection() end, desc = "Select database" },
+    { "<leader>sa", function() require("sqlui").browser() end, desc = "Schema browser" },
+    { "<leader>sc", function() require("sqlui").build_cache() end, desc = "Build schema cache" },
+    { "<leader>sh", function() require("sqlui").history() end, desc = "SQL history" },
+    { "<leader>s?", function() require("sqlui").help() end, desc = "Help" },
+  },
 }
 ```
 
-### Minimal Setup
+### Minimal setup
 
 ```lua
 require("sqlui").setup({
-  ui = {
-    picker = "auto",
-  },
-  secrets = {
-    backend = "auto",
-  },
+  ui = { picker = "auto" },
+  secrets = { backend = "auto" },
 })
 ```
 
+## Keymaps
+
+| Key | Mode | Action |
+|-----|------|--------|
+| `<leader>ss` | n | Open SQL actions menu |
+| `<leader>ss` | x | SQL menu with visual selection |
+| `<leader>sr` | n | Run SQL with last connection |
+| `<leader>sr` | x | Run selected SQL with last connection |
+| `<leader>se` | n/x | Export to CSV |
+| `<leader>sx` | n/x | Export to XLSX |
+| `<leader>sl` | n | Select connection |
+| `<leader>sb` | n | Select database connection |
+| `<leader>sa` | n | Open schema browser |
+| `<leader>sc` | n | Build schema cache |
+| `<leader>sh` | n | SQL history |
+| `<leader>s?` | n | Help / keybinding guide |
+
+### Schema browser
+
+| Key | Action |
+|-----|--------|
+| `<Enter>` | Open data viewer (tables/views) |
+| `<C-y>` | Insert object name into buffer |
+
+### Data viewer
+
+| Key | Action |
+|-----|--------|
+| `]p` | Next page |
+| `[p` | Previous page |
+| `ff` | Set filter |
+| `fc` | Clear filter |
+| `fo` | Change order column |
+| `fp` | Change page size (25/50/100/250/500) |
+| `r` | Refresh |
+| `q` | Close |
+
+Filters support multiple conditions separated by `;`:
+
+```
+status=ativo;nome~joao
+```
+
+Operators: `=` (exact), `~` (contains/LIKE), `!=` (not equal), `>`, `<`, `>=`, `<=`.
+
 ## Commands
 
-- `:SqlUiMenu`
-- `:SqlUiRun`
-- `:SqlUiRunSelection`
-- `:SqlUiRunLastConnection`
-- `:SqlUiSelectConnection`
-- `:SqlUiBrowser`
-- `:SqlUiViewData [schema.table]`
-- `:SqlUiHistory`
-- `:SqlUiExportCsv`
-- `:SqlUiExportXlsx`
-- `:SqlUiBuildCache`
-- `:SqlUiClearCache`
-- `:SqlUiHelp`
-- `:checkhealth sqlui`
+| Command | Description |
+|---------|-------------|
+| `:SqlUiMenu` | Open SQL actions menu |
+| `:SqlUiRun` | Execute current buffer |
+| `:SqlUiRunSelection` | Execute visual selection |
+| `:SqlUiRunLastConnection` | Run with last used connection |
+| `:SqlUiSelectConnection` | Select or manage connections |
+| `:SqlUiBrowser` | Open schema browser |
+| `:SqlUiViewData [schema.table]` | Open data viewer |
+| `:SqlUiHistory` | Browse SQL history |
+| `:SqlUiExportCsv` | Export to CSV |
+| `:SqlUiExportXlsx` | Export to XLSX |
+| `:SqlUiBuildCache` | Build schema cache |
+| `:SqlUiClearCache` | Clear schema cache |
+| `:SqlUiHelp` | Show help |
+| `:checkhealth sqlui` | Check dependencies |
 
-## Current Test Flow
+## Connection management
 
-Use these commands in the current build:
+`<leader>sb` opens the connection picker with these options:
 
-- `:SqlUiSelectConnection` - select or manage a connection
-- `:SqlUiRun` - execute the current SQL buffer
-- `:SqlUiRunSelection` - execute the selected SQL
-- `:SqlUiRunLastConnection` - run the current SQL on the last connection
-- `:SqlUiHistory` - re-run an item from SQL history
-- `:SqlUiExportCsv` - export current SQL to CSV
-- `:SqlUiExportXlsx` - export current SQL to XLSX
-- `:SqlUiBrowser` - browse schemas and SQL objects
-- `:SqlUiViewData` - open paginated data viewer for a table/view
-- `:SqlUiBuildCache` - build persistent schema cache
-  - object metadata is cached first; columns are fetched on demand by default
-- `:SqlUiClearCache` - clear persistent schema cache
-- `<leader>sc` builds cache for the current connection (or the last saved one)
+- **Saved connections** — select and connect with schema picker
+- **+ Nova conexao salva** — create a new saved connection (alias + DSN)
+- **+ Editar conexao salva** — edit an existing connection's DSN
+- **+ Renomear conexao salva** — rename a connection alias
+- **+ Duplicar conexao salva** — duplicate an existing connection
+- **+ Remover conexao salva** — delete a connection
+- **+ Conexao temporaria** — one-time connection (not persisted)
 
-Inside the schema browser:
+DSN format follows `usql` conventions:
 
-- `<Enter>` on tables/views opens the data viewer
-- `<C-y>` inserts the selected object name into the current buffer
+```
+postgres://user:password@host:5432/database
+mssql://user:password@host/database
+mysql://user:password@host:3306/database
+sqlserver://user:password@host?database=dbname
+```
 
-Inside the data viewer:
+> Passwords with special characters must be URL-encoded in the DSN.
 
-- `]p` / `[p` paginate
-- `ff` set filter
-- `fc` clear filter
-- `fo` change order column
-- `r` refresh
-- `q` close viewer
-- multiple filters are supported with `;`
-  - example: `status=ativo;nome~joao`
+## Secure storage
+
+Credentials are stored using the platform's native secret manager:
+
+| Platform | Backend |
+|----------|---------|
+| macOS | Keychain (`security` CLI) |
+| Linux (GNOME) | `secret-tool` |
+| Linux (KDE) | `kwallet-query` |
+| Fallback | Local file (development only) |
+
+## Lualine integration
+
+Add to your lualine config to show the active connection in the statusline:
+
+```lua
+lualine_x = {
+  { require("sqlui.integrations.lualine").connection_status },
+}
+```
+
+Displays: `alias/schema` when connected, empty otherwise.
 
 ## Architecture
 
-- `lua/sqlui/init.lua` - public setup and command entrypoints
-- `lua/sqlui/config.lua` - defaults and user config merge
-- `lua/sqlui/state.lua` - runtime state and persisted aliases/history
-- `lua/sqlui/connection/` - connection CRUD and secret backend selection
-- `lua/sqlui/runner/` - execution, exports, and history integration
-- `lua/sqlui/schema/` - schema browser and cache migration target
-- `lua/sqlui/secrets/` - secure secret backends by platform
-- `lua/sqlui/ui/` - picker/input abstraction
-- `plugin/sqlui.lua` - Ex commands
-- `doc/sqlui.txt` - `:help` documentation
+```
+sqlui.nvim/
+├── lua/sqlui/
+│   ├── init.lua              -- setup and public API
+│   ├── config.lua            -- defaults and config merge
+│   ├── state.lua             -- persistent state (aliases, history, cache paths)
+│   ├── connection/           -- connection CRUD, schema picker, driver detection
+│   ├── runner/               -- query execution, exports, history
+│   ├── schema/               -- schema browser, cache, completion items
+│   ├── data_viewer/          -- paginated data viewer with filters
+│   ├── completion/           -- nvim-cmp source
+│   ├── lsp/                  -- sqls LSP integration
+│   ├── secrets/              -- platform secret backends
+│   ├── integrations/         -- telescope, lualine
+│   ├── ui/                   -- picker/input abstraction
+│   └── util/                 -- fs, platform detection
+├── plugin/sqlui.lua          -- Ex commands
+├── doc/sqlui.txt             -- :help sqlui
+├── health/                   -- :checkhealth
+└── tests/                    -- smoke and regression tests
+```
 
-## Platform Strategy
+## License
 
-- macOS: `security` Keychain backend
-- Linux GNOME: `secret-tool`
-- Linux KDE: `kwallet-query`
-- fallback: local file backend for development only
-
-## Development Roadmap
-
-1. stabilize runner and connection lifecycle
-2. migrate schema browser and persistent cache
-3. migrate completion and `sqls` integration
-4. add Telescope-native UI module
-5. add tests, CI, and first release tag
-
-## Development Priorities
-
-1. Core execution and connection lifecycle
-2. Secret backend abstraction
-3. Persistent schema cache
-4. Browser and completion integration
-5. Linux portability and CI
+MIT
