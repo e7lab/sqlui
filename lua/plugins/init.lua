@@ -20,7 +20,7 @@ return {
     config = function()
       require("github-theme").setup({
         options = {
-          transparent = true,
+          transparent = false,
         },
       })
       vim.cmd.colorscheme("github_dark")
@@ -181,11 +181,21 @@ return {
             end, "Telescope find files (dir)")
           end
 
-          map("<C-n>", api.node.open.tab, "Open in new tab")
-        end,
-      })
-    end,
-  },
+           map("<C-n>", api.node.open.tab, "Open in new tab")
+           
+           -- Open file in new tab on Enter
+           map("<CR>", function()
+             local node = api.tree.get_node_under_cursor()
+             if node and node.type == "file" then
+               api.node.open.tab(node)
+             elseif node and node.type == "directory" then
+               api.node.open.edit(node)
+             end
+           end, "Open file in new tab or expand directory")
+         end,
+       })
+     end,
+   },
 
   -- Git
   { "tpope/vim-fugitive" },
@@ -242,14 +252,47 @@ return {
       local function branch_colors()
         local branch = current_branch()
         if branch == "main" or branch == "master" then
-          return { fg = "#ffffff", bg = "#ff0000", gui = "bold" }
+          return { fg = "#ffffff", bg = "#444444", gui = "bold" }
         end
-        return { fg = "#ffffff", bg = "#0000ff" }
+        return { fg = "#000000", bg = "#999999" }
       end
+
+      local gray_theme = {
+        normal = {
+          a = { bg = '#89b4fa', fg = '#0d1117', gui = 'bold' },
+          b = { bg = '#1e2a3a', fg = '#b8c9e3' },
+          c = { bg = '#141b2d', fg = '#7a8da6' }
+        },
+        insert = {
+          a = { bg = '#74c7ec', fg = '#0d1117', gui = 'bold' },
+          b = { bg = '#1e2a3a', fg = '#b8c9e3' },
+          c = { bg = '#141b2d', fg = '#7a8da6' }
+        },
+        visual = {
+          a = { bg = '#b4befe', fg = '#0d1117', gui = 'bold' },
+          b = { bg = '#1e2a3a', fg = '#b8c9e3' },
+          c = { bg = '#141b2d', fg = '#7a8da6' }
+        },
+        replace = {
+          a = { bg = '#94e2d5', fg = '#0d1117', gui = 'bold' },
+          b = { bg = '#1e2a3a', fg = '#b8c9e3' },
+          c = { bg = '#141b2d', fg = '#7a8da6' }
+        },
+        command = {
+          a = { bg = '#a6d1e6', fg = '#0d1117', gui = 'bold' },
+          b = { bg = '#1e2a3a', fg = '#b8c9e3' },
+          c = { bg = '#141b2d', fg = '#7a8da6' }
+        },
+        inactive = {
+          a = { bg = '#141b2d', fg = '#4a5568', gui = 'bold' },
+          b = { bg = '#141b2d', fg = '#4a5568' },
+          c = { bg = '#141b2d', fg = '#4a5568' }
+        }
+      }
 
       require("lualine").setup({
         options = {
-          theme = "auto",
+          theme = gray_theme,
           globalstatus = true,
           section_separators = { left = "", right = "" },
           component_separators = { left = "|", right = "|" },
@@ -270,16 +313,56 @@ return {
               path = 1,
             },
           },
-          lualine_x = { "diagnostics", "filetype" },
+          lualine_x = { require("sqlui.integrations.lualine").component(), "diagnostics", "filetype" },
           lualine_y = { "progress" },
           lualine_z = { "location" },
         },
       })
     end,
   },
-  { "sindrets/diffview.nvim" },
+   { "sindrets/diffview.nvim" },
 
-  -- Telescope
+   -- Tabline with icons
+   {
+     "nvim-lualine/lualine.nvim",
+     optional = true,
+   },
+   {
+     "akinsho/bufferline.nvim",
+     version = "*",
+     dependencies = { "nvim-tree/nvim-web-devicons" },
+     config = function()
+       require("bufferline").setup({
+         options = {
+           mode = "tabs",
+           separator_style = "slant",
+           show_buffer_close_icons = true,
+           show_close_icon = true,
+           color_icons = true,
+           diagnostics = "nvim_lsp",
+           diagnostics_indicator = function(count, level, diagnostics_dict, context)
+             local icon = level:match("error") and " " or " "
+             return " " .. icon .. count
+           end,
+           offsets = {
+             {
+               filetype = "NvimTree",
+               text = "File Explorer",
+               text_align = "left",
+             },
+           },
+         },
+         highlights = {
+           fill = {
+             fg = { attribute = "fg", highlight = "Normal" },
+             bg = { attribute = "bg", highlight = "StatusLineNC" },
+           },
+         },
+       })
+     end,
+   },
+
+   -- Telescope
   { "nvim-lua/plenary.nvim" },
   {
     "nvim-treesitter/nvim-treesitter",
@@ -307,11 +390,22 @@ return {
   },
   {
     "nvim-telescope/telescope.nvim",
-    dependencies = { "nvim-lua/plenary.nvim" },
+    dependencies = {
+      "nvim-lua/plenary.nvim",
+      { "nvim-telescope/telescope-fzf-native.nvim", build = "make" },
+    },
     enabled = function()
       -- telescope.nvim requires >= 0.10.4
       return has_nvim(0, 10, 4)
     end,
+    keys = {
+      { "<leader>fb", "<cmd>Telescope buffers<CR>", desc = "Telescope buffers" },
+      { "<leader>ff", "<cmd>Telescope find_files<CR>", desc = "Telescope find files" },
+      { "<leader>gf", "<cmd>Telescope git_files<CR>", desc = "Telescope git files" },
+      { "<leader>gc", "<cmd>Telescope git_commits<CR>", desc = "Telescope git commits" },
+      { "<leader>tt", "<cmd>Telescope builtin<CR>", desc = "Telescope builtin" },
+      { "<C-k>f", "<cmd>Telescope find_files<CR>", desc = "Telescope find files" },
+    },
     config = function()
       local actions = require("telescope.actions")
       local action_state = require("telescope.actions.state")
@@ -349,6 +443,14 @@ return {
             },
           },
         },
+        extensions = {
+          fzf = {
+            fuzzy = true,
+            override_generic_sorter = true,
+            override_file_sorter = true,
+            case_mode = "smart_case",
+          },
+        },
         pickers = {
           git_commits = {
             current_previewer_index = 4,
@@ -364,6 +466,103 @@ return {
               n = { ["<CR>"] = open_in_diffview },
             },
           },
+        },
+      })
+
+      require("telescope").load_extension("fzf")
+    end,
+  },
+  {
+    "hrsh7th/nvim-cmp",
+    dependencies = {
+      "hrsh7th/cmp-nvim-lsp",
+      "hrsh7th/cmp-buffer",
+      "hrsh7th/cmp-path",
+    },
+    config = function()
+      local cmp = require("cmp")
+      local cmp_types = require("cmp.types")
+      require("sqlui.completion").setup()
+
+      vim.o.completeopt = "menu,menuone,noselect"
+
+      cmp.setup({
+        snippet = {
+          expand = function(args)
+            vim.snippet.expand(args.body)
+          end,
+        },
+        mapping = cmp.mapping.preset.insert({
+          ["<C-Space>"] = cmp.mapping.complete(),
+          ["<CR>"] = cmp.mapping.confirm({ select = false }),
+          ["<Tab>"] = cmp.mapping(function(fallback)
+            if cmp.visible() then
+              cmp.select_next_item()
+            else
+              fallback()
+            end
+          end, { "i", "s" }),
+          ["<S-Tab>"] = cmp.mapping(function(fallback)
+            if cmp.visible() then
+              cmp.select_prev_item()
+            else
+              fallback()
+            end
+          end, { "i", "s" }),
+        }),
+        sources = cmp.config.sources({
+          { name = "nvim_lsp" },
+          { name = "path" },
+        }, {
+          { name = "buffer" },
+        }),
+      })
+
+      cmp.setup.filetype("sql", {
+        sources = cmp.config.sources({
+          { name = "sqlui_cache", priority = 1000 },
+          { name = "nvim_lsp" },
+          { name = "buffer" },
+        }),
+        completion = {
+          autocomplete = {
+            cmp_types.cmp.TriggerEvent.TextChanged,
+            cmp_types.cmp.TriggerEvent.InsertEnter,
+          },
+        },
+      })
+    end,
+  },
+  {
+    dir = vim.fn.stdpath("config") .. "/sqlui.nvim",
+    name = "sqlui.nvim",
+    lazy = false,
+    keys = {
+      { "<leader>ss", function() require("sqlui").menu() end, desc = "Open SQL actions menu" },
+      { "<leader>ss", function() require("sqlui").menu_selection_from_visual() end, mode = "x", desc = "Open selected SQL actions menu" },
+      { "<leader>sr", function() require("sqlui").run_last_connection() end, desc = "Run SQL with last connection" },
+      { "<leader>sr", function() require("sqlui").run_last_connection_selection_from_visual() end, mode = "x", desc = "Run selected SQL with last connection" },
+      { "<leader>se", function() require("sqlui").export_csv() end, desc = "Export SQL to CSV" },
+      { "<leader>se", function() require("sqlui").export_csv_selection_from_visual() end, mode = "x", desc = "Export selected SQL to CSV" },
+      { "<leader>sx", function() require("sqlui").export_xlsx() end, desc = "Export SQL to XLSX" },
+      { "<leader>sx", function() require("sqlui").export_xlsx_selection_from_visual() end, mode = "x", desc = "Export selected SQL to XLSX" },
+      { "<leader>sl", function() require("sqlui").select_connection() end, desc = "Select SQL connection" },
+      { "<leader>sb", function() require("sqlui").select_connection() end, desc = "Select SQL database connection" },
+      { "<leader>sa", function() require("sqlui").browser() end, desc = "Open SQL schema browser" },
+      { "<leader>sc", function() require("sqlui").build_cache() end, desc = "Build SQL cache for current connection" },
+      { "<leader>sh", function() require("sqlui").history() end, desc = "Show usql history" },
+      { "<leader>s?", function() require("sqlui").help() end, desc = "Show SQL plugin guide" },
+    },
+    config = function()
+      require("sqlui").setup({
+        ui = {
+          picker = "auto",
+        },
+        secrets = {
+          backend = "auto",
+        },
+        usql = {
+          bin = "usql",
         },
       })
     end,
