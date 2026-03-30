@@ -281,7 +281,30 @@ return {
 
   -- Telescope
   { "nvim-lua/plenary.nvim" },
-  { "nvim-treesitter/nvim-treesitter", build = ":TSUpdate" },
+  {
+    "nvim-treesitter/nvim-treesitter",
+    build = ":TSUpdate",
+    config = function()
+      -- Registra o parser externo para Bruno (.bru)
+      require("nvim-treesitter.parsers").get_parser_configs()["bruno"] = {
+        install_info = {
+          url      = "https://github.com/Scalamando/tree-sitter-bruno",
+          files    = { "src/parser.c", "src/scanner.c" },
+          revision = "dd27fe0eff8e7f8184dfc91e426b886dc8369c46",
+        },
+        filetype = "bru",
+        tier = 3,
+      }
+      vim.treesitter.language.register("bruno", "bru")
+
+      require("nvim-treesitter.configs").setup({
+        ensure_installed = { "bruno" },
+        auto_install     = true,
+        highlight        = { enable = true },
+        indent           = { enable = true },
+      })
+    end,
+  },
   {
     "nvim-telescope/telescope.nvim",
     dependencies = { "nvim-lua/plenary.nvim" },
