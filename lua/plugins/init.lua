@@ -429,4 +429,27 @@ return {
       require("mason").setup({})
     end,
   },
+
+  -- Bruno REST client (requires `bru` CLI: npm install -g @usebruno/cli)
+  {
+    "romek-codes/bruno.nvim",
+    dependencies = {
+      "nvim-lua/plenary.nvim",
+      "nvim-telescope/telescope.nvim",
+    },
+    keys = {
+      { "<leader>br", "<cmd>BrunoRun<CR>",          desc = "Bruno: run current .bru file" },
+      { "<leader>be", "<cmd>BrunoEnv<CR>",          desc = "Bruno: select environment" },
+      { "<leader>bs", "<cmd>BrunoSearch<CR>",       desc = "Bruno: search .bru files" },
+      { "<leader>bf", "<cmd>BrunoToggleFormat<CR>", desc = "Bruno: toggle output format" },
+    },
+    config = function()
+      require("bruno").setup({
+        collection_paths = {},  -- populate with your Bruno collection paths when needed
+        picker = "telescope",
+        show_formatted_output = true,
+        suppress_formatting_errors = false,
+      })
+    end,
+  },
 }
