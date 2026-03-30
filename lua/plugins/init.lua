@@ -367,25 +367,32 @@ return {
   {
     "nvim-treesitter/nvim-treesitter",
     build = ":TSUpdate",
-    config = function()
-      -- Registra o parser externo para Bruno (.bru)
-      require("nvim-treesitter.parsers").get_parser_configs()["bruno"] = {
-        install_info = {
-          url      = "https://github.com/Scalamando/tree-sitter-bruno",
-          files    = { "src/parser.c", "src/scanner.c" },
-          revision = "dd27fe0eff8e7f8184dfc91e426b886dc8369c46",
-        },
-        filetype = "bru",
-        tier = 3,
-      }
-      vim.treesitter.language.register("bruno", "bru")
+    init = function()
+      -- O install.lua faz reload_parsers() que descarta entries adicionadas em
+      -- memória. A forma correta de registrar parsers externos na v1 é via o
+      -- autocmd User TSUpdate, disparado após cada reload.
+      local function register_bruno()
+        local parsers = require("nvim-treesitter.parsers")
+        parsers["bruno"] = {
+          install_info = {
+            url      = "https://github.com/Scalamando/tree-sitter-bruno",
+            files    = { "src/parser.c", "src/scanner.c" },
+            revision = "dd27fe0eff8e7f8184dfc91e426b886dc8369c46",
+          },
+          filetype = "bru",
+          tier     = 3,
+        }
+      end
 
-      require("nvim-treesitter.configs").setup({
-        ensure_installed = { "bruno" },
-        auto_install     = true,
-        highlight        = { enable = true },
-        indent           = { enable = true },
+      register_bruno()
+
+      vim.api.nvim_create_autocmd("User", {
+        pattern  = "TSUpdate",
+        callback = register_bruno,
       })
+
+      -- Vincula o filetype "bru" ao parser "bruno" (API nativa do Neovim)
+      vim.treesitter.language.register("bruno", "bru")
     end,
   },
   {
