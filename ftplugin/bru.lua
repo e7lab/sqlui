@@ -1,18 +1,26 @@
 -- ftplugin/bru.lua
--- Indentation settings for Bruno (.bru) files.
--- The bru format uses braces {} for blocks, similar to C-style languages.
+-- Indentation and treesitter activation for Bruno (.bru) files.
 
-vim.opt_local.expandtab  = true
-vim.opt_local.shiftwidth = 2
-vim.opt_local.tabstop    = 2
+vim.opt_local.expandtab   = true
+vim.opt_local.shiftwidth  = 2
+vim.opt_local.tabstop     = 2
 vim.opt_local.softtabstop = 2
 
--- Use a simple brace-based indent expression as fallback when the
--- tree-sitter parser is not yet compiled.
-if not pcall(vim.treesitter.get_parser, 0, "bruno") then
-  vim.opt_local.cindent    = true
-  vim.opt_local.cinkeys    = vim.opt_local.cinkeys + "{"
-  vim.opt_local.cinkeys    = vim.opt_local.cinkeys + "}"
-  vim.opt_local.indentkeys = vim.opt_local.indentkeys + "{"
-  vim.opt_local.indentkeys = vim.opt_local.indentkeys + "}"
+-- Ativa treesitter (highlight + indent via indents.scm).
+-- vim.treesitter.start() ativa highlight; o indentexpr é definido pelo
+-- módulo nvim-treesitter quando a query indents.scm estiver presente.
+local ok_ts = pcall(vim.treesitter.start, 0, "bruno")
+
+if ok_ts then
+  -- nvim-treesitter define indentexpr via seu módulo de indent
+  local ok_ind = pcall(function()
+    vim.bo.indentexpr = "v:lua.require'nvim-treesitter.indent'.get_indent(v:lnum)"
+  end)
+  if not ok_ind then
+    -- fallback: linematch simples baseado em chaves
+    vim.opt_local.cindent = true
+  end
+else
+  -- Treesitter não disponível: usa cindent como fallback
+  vim.opt_local.cindent = true
 end
