@@ -242,19 +242,35 @@ local function build_filter_clause(driver, filter_text)
 
   local clauses = {}
   for _, text in ipairs(parts) do
-    local column, op, value = text:match("^([%w_]+)%s*([=~])%s*(.+)$")
+    -- Operators: <>, >=, <=, ~, =, >, <  (order matters — longest match first)
+    local column, op, value = text:match("^([%w_]+)%s*(<>)%s*(.+)$")
+    if not column then column, op, value = text:match("^([%w_]+)%s*(>=)%s*(.+)$") end
+    if not column then column, op, value = text:match("^([%w_]+)%s*(<=)%s*(.+)$") end
+    if not column then column, op, value = text:match("^([%w_]+)%s*([~=><])%s*(.+)$") end
+
     if not column then
-      return nil, "use o formato coluna=valor ou coluna~valor;coluna2=valor2"
+      return nil, "use: col=val  col~val  col<>val  col>val  col<val  col>=val  col<=val"
     end
 
     local quoted = quote_ident(driver, column)
+
     if op == "~" then
       local like_target = driver == "postgres"
         and string.format("CAST(%s AS text)", quoted)
         or quoted
       local like_op = driver == "postgres" and "ILIKE" or "LIKE"
       table.insert(clauses, string.format("%s %s '%%%s%%'", like_target, like_op, escape_sql_string(value)))
+    elseif op == "<>" or op == ">" or op == "<" or op == ">=" or op == "<=" then
+      local literal, is_null = sql_literal(value)
+      if is_null then
+        -- NULL comparisons: <> NULL → IS NOT NULL; others degrade to IS NULL
+        local null_op = op == "<>" and "IS NOT NULL" or "IS NULL"
+        table.insert(clauses, string.format("%s %s", quoted, null_op))
+      else
+        table.insert(clauses, string.format("%s %s %s", quoted, op, literal))
+      end
     else
+      -- op == "="
       local literal, is_null = sql_literal(value)
       if is_null then
         table.insert(clauses, string.format("%s IS NULL", quoted))
@@ -558,7 +574,7 @@ local function set_viewer_maps(data_bufnr)
     if not ctx then
       return
     end
-    picker.input({ prompt = "Filtro (coluna=valor;coluna2~valor): ", default = ctx.filter or "" }, function(value)
+    picker.input({ prompt = "Filtro (col=val  col~val  col<>val  col>val  col>=val  col<val  col<=val  ;sep): ", default = ctx.filter or "" }, function(value)
       ctx.filter = trim(value)
       ctx.page = 1
       refresh_viewer(data_bufnr)
