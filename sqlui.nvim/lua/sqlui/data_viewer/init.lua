@@ -419,7 +419,7 @@ local function build_header_lines(ctx, widths)
       ctx.order_by,
       trim(ctx.filter) ~= "" and ctx.filter or "<nenhum>"
     ),
-    "Atalhos: ]p prox | [p ant | ff filtro | fc limpar | fo ordenar | fp linhas/pag | r recarregar | q fechar",
+    "Atalhos: <C-g> prox | <C-e> ant | ff filtro | fc limpar | fo ordenar | fp linhas/pag | r recarregar | q fechar",
     header,
     separator,
   }
@@ -435,7 +435,7 @@ local function build_data_lines(ctx, widths)
   end
   if ctx.has_next then
     table.insert(lines, "")
-    table.insert(lines, "-- proxima pagina disponivel (]p) --")
+    table.insert(lines, "-- proxima pagina disponivel (<C-g>) --")
   end
   return lines
 end
@@ -549,7 +549,7 @@ local function set_viewer_maps(data_bufnr)
     vim.keymap.set("n", lhs, rhs, { buffer = data_bufnr, silent = true, desc = desc })
   end
 
-  map("]p", function()
+  map("<C-g>", function()
     local ctx = viewers[data_bufnr]
     if not ctx or not ctx.has_next then
       notify("nao ha proxima pagina", vim.log.levels.WARN)
@@ -559,7 +559,7 @@ local function set_viewer_maps(data_bufnr)
     refresh_viewer(data_bufnr)
   end, "sqlui next page")
 
-  map("[p", function()
+  map("<C-e>", function()
     local ctx = viewers[data_bufnr]
     if not ctx or ctx.page <= 1 then
       notify("ja esta na primeira pagina", vim.log.levels.WARN)
