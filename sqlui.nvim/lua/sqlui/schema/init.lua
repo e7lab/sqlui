@@ -844,6 +844,74 @@ local function cached_columns_preview(conn, category, item)
   return columns_preview_text(item, category, columns)
 end
 
+local function routine_preview_cache_key(dsn, item)
+  return table.concat({ dsn, item.schema or "", item.name or "" }, "::")
+end
+
+local function fetch_routine_preview(dsn, driver, schema, name)
+  local cache_key = routine_preview_cache_key(dsn, { schema = schema, name = name })
+  if session.routine_preview_cache and session.routine_preview_cache[cache_key] then
+    return session.routine_preview_cache[cache_key]
+  end
+
+  local params, _ = run_usql_json(
+    dsn,
+    string.format(
+      "select PARAMETER_NAME, DATA_TYPE, ORDINAL_POSITION from INFORMATION_SCHEMA.PARAMETERS where SPECIFIC_SCHEMA = '%s' and SPECIFIC_NAME = '%s' order by ORDINAL_POSITION",
+      schema, name
+    )
+  )
+
+  local def_sql
+  if driver == "mssql" then
+    def_sql = string.format(
+      "select top 1 ROUTINE_DEFINITION from INFORMATION_SCHEMA.ROUTINES where ROUTINE_SCHEMA = '%s' and ROUTINE_NAME = '%s'",
+      schema, name
+    )
+  else
+    def_sql = string.format(
+      "select ROUTINE_DEFINITION from INFORMATION_SCHEMA.ROUTINES where ROUTINE_SCHEMA = '%s' and ROUTINE_NAME = '%s' limit 1",
+      schema, name
+    )
+  end
+  local def, _ = run_usql_json(dsn, def_sql)
+  local definition = def and def[1] and row_field(def[1], "ROUTINE_DEFINITION", "routine_definition", "routineDefinition")
+
+  local result = { params = params or {}, definition = trim(definition or "") }
+  session.routine_preview_cache = session.routine_preview_cache or {}
+  session.routine_preview_cache[cache_key] = result
+  return result
+end
+
+local function open_routine_sql(conn, item)
+  local driver = connection.detect_driver(conn.dsn)
+  if driver == "sqlite" then
+    notify("SQLite nao suporta functions/procedures", vim.log.levels.WARN)
+    return
+  end
+
+  local schema = escape_sql_string(item.schema)
+  local name = escape_sql_string(item.name)
+  local data = fetch_routine_preview(conn.dsn, driver, schema, name)
+
+  if data.definition == "" then
+    notify("Definicao nao disponivel para " .. item.name, vim.log.levels.WARN)
+    return
+  end
+
+  vim.cmd("tabnew")
+  local buf = vim.api.nvim_get_current_buf()
+  local buf_name = string.format("sqlui://%s.%s.sql", item.schema, item.name)
+  pcall(vim.api.nvim_buf_set_name, buf, buf_name)
+  vim.bo[buf].filetype = "sql"
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(data.definition, "\n", { plain = true }))
+  vim.bo[buf].modifiable = false
+end
+
 local function schema_preview_text(dsn, category, item)
   local schema = escape_sql_string(item.schema)
   local name = escape_sql_string(item.name)
@@ -861,67 +929,35 @@ local function schema_preview_text(dsn, category, item)
       "",
     }
 
-    local params, params_err = run_usql_json(
-      dsn,
-      string.format(
-        "select PARAMETER_NAME, DATA_TYPE, ORDINAL_POSITION from INFORMATION_SCHEMA.PARAMETERS where SPECIFIC_SCHEMA = '%s' and SPECIFIC_NAME = '%s' order by ORDINAL_POSITION",
-        schema,
-        name
-      )
-    )
+    local data = fetch_routine_preview(dsn, driver, schema, name)
 
-    if params and #params > 0 then
+    if #data.params > 0 then
       table.insert(lines, "Parametros:")
-      for _, param in ipairs(params) do
+      for _, param in ipairs(data.params) do
         table.insert(lines, string.format(
           "- %s: %s",
           row_field(param, "PARAMETER_NAME", "parameter_name", "parameterName") or "<retorno>",
           row_field(param, "DATA_TYPE", "data_type", "dataType") or "?"
         ))
       end
-    elseif params_err then
-      table.insert(lines, "Parametros: erro ao carregar")
-      table.insert(lines, params_err)
     else
-      table.insert(lines, "Parametros: nenhum parametro encontrado")
+      table.insert(lines, "Parametros: nenhum")
     end
 
-    local driver = connection.detect_driver(dsn)
-    local def_sql
-    if driver == "mssql" then
-      def_sql = string.format(
-        "select top 1 ROUTINE_DEFINITION from INFORMATION_SCHEMA.ROUTINES where ROUTINE_SCHEMA = '%s' and ROUTINE_NAME = '%s'",
-        schema,
-        name
-      )
-    else
-      def_sql = string.format(
-        "select ROUTINE_DEFINITION from INFORMATION_SCHEMA.ROUTINES where ROUTINE_SCHEMA = '%s' and ROUTINE_NAME = '%s' limit 1",
-        schema,
-        name
-      )
-    end
-
-    local def, def_err = run_usql_json(dsn, def_sql)
-
-    local definition = def and def[1] and row_field(def[1], "ROUTINE_DEFINITION", "routine_definition", "routineDefinition")
-    if trim(definition) ~= "" then
+    if data.definition ~= "" then
       table.insert(lines, "")
-      table.insert(lines, "Definicao:")
-      local definition_lines = vim.split(definition, "\n", { plain = true })
-      local shown = 0
-      for _, line in ipairs(definition_lines) do
-        shown = shown + 1
-        if shown > routine_preview_line_limit() then
+      table.insert(lines, "Definicao (Enter para abrir):")
+      local definition_lines = vim.split(data.definition, "\n", { plain = true })
+      for i, line in ipairs(definition_lines) do
+        if i > routine_preview_line_limit() then
           table.insert(lines, string.format("... (%d linhas ocultas)", #definition_lines - routine_preview_line_limit()))
           break
         end
         table.insert(lines, line)
       end
-    elseif def_err then
+    else
       table.insert(lines, "")
-      table.insert(lines, "Definicao: erro ao carregar")
-      table.insert(lines, def_err)
+      table.insert(lines, "Definicao: nao disponivel")
     end
 
     return table.concat(lines, "\n")
@@ -1320,6 +1356,12 @@ local function open_schema_browser(conn, schema_name, category_key, page)
           if category.key == "tables" or category.key == "views" then
             vim.schedule(function()
               data_viewer.open_for_item(conn, entry.item)
+            end)
+            return
+          end
+          if category.key == "functions" or category.key == "procedures" then
+            vim.schedule(function()
+              open_routine_sql(conn, entry.item)
             end)
             return
           end
