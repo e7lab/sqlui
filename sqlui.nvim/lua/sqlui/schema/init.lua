@@ -27,14 +27,18 @@ local schema_categories = {
   {
     key = "functions",
     label = "Functions",
-    list_sql = "select ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE from INFORMATION_SCHEMA.ROUTINES where ROUTINE_TYPE = 'FUNCTION' order by ROUTINE_SCHEMA, ROUTINE_NAME",
-    list_sql_sqlite = nil,
+    list_sql          = "select ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE from INFORMATION_SCHEMA.ROUTINES where ROUTINE_TYPE = 'FUNCTION' order by ROUTINE_SCHEMA, ROUTINE_NAME",
+    list_sql_postgres = "select n.nspname as ROUTINE_SCHEMA, p.proname as ROUTINE_NAME, 'FUNCTION' as ROUTINE_TYPE from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.prokind = 'f' order by n.nspname, p.proname",
+    list_sql_mssql    = "select SCHEMA_NAME(schema_id) as ROUTINE_SCHEMA, name as ROUTINE_NAME, 'FUNCTION' as ROUTINE_TYPE from sys.objects where type in ('FN','IF','TF') order by ROUTINE_SCHEMA, ROUTINE_NAME",
+    list_sql_sqlite   = nil,
   },
   {
     key = "procedures",
     label = "Procedures",
-    list_sql = "select ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE from INFORMATION_SCHEMA.ROUTINES where ROUTINE_TYPE = 'PROCEDURE' order by ROUTINE_SCHEMA, ROUTINE_NAME",
-    list_sql_sqlite = nil,
+    list_sql          = "select ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE from INFORMATION_SCHEMA.ROUTINES where ROUTINE_TYPE = 'PROCEDURE' order by ROUTINE_SCHEMA, ROUTINE_NAME",
+    list_sql_postgres = "select n.nspname as ROUTINE_SCHEMA, p.proname as ROUTINE_NAME, 'PROCEDURE' as ROUTINE_TYPE from pg_proc p join pg_namespace n on n.oid = p.pronamespace where p.prokind = 'p' order by n.nspname, p.proname",
+    list_sql_mssql    = "select SCHEMA_NAME(schema_id) as ROUTINE_SCHEMA, name as ROUTINE_NAME, 'PROCEDURE' as ROUTINE_TYPE from sys.procedures order by ROUTINE_SCHEMA, ROUTINE_NAME",
+    list_sql_sqlite   = nil,
   },
 }
 
@@ -600,7 +604,16 @@ local function schema_list_items(dsn, category, schema_name, search_term, limit,
     return {}, nil
   end
 
-  local sql = driver == "sqlite" and category.list_sql_sqlite or category.list_sql
+  local sql
+  if driver == "sqlite" then
+    sql = category.list_sql_sqlite
+  elseif driver == "postgres" and category.list_sql_postgres then
+    sql = category.list_sql_postgres
+  elseif driver == "mssql" and category.list_sql_mssql then
+    sql = category.list_sql_mssql
+  else
+    sql = category.list_sql
+  end
   if not sql then
     session.schema_cache[cache_key] = {}
     return {}, nil
