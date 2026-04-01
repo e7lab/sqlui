@@ -1204,7 +1204,7 @@ local function open_schema_browser(conn, schema_name, category_key, page)
   if has_next then
     table.insert(items, {
       kind = "hint",
-      name = string.format("<C-f>  próxima página (%d)", current_page + 1),
+      name = string.format("<C-g>  próxima página (%d)", current_page + 1),
       schema = schema_sql_name,
       type = category.label,
     })
@@ -1212,7 +1212,7 @@ local function open_schema_browser(conn, schema_name, category_key, page)
   if current_page > 1 then
     table.insert(items, 1, {
       kind = "hint",
-      name = string.format("<C-b>  página anterior (%d)", current_page - 1),
+      name = string.format("<C-e>  página anterior (%d)", current_page - 1),
       schema = schema_sql_name,
       type = category.label,
     })
@@ -1295,7 +1295,7 @@ local function open_schema_browser(conn, schema_name, category_key, page)
         end
 
         if has_next then
-          map("<C-f>", function()
+          map("<C-g>", function()
             actions.close(prompt_bufnr)
             vim.schedule(function()
               open_schema_browser(conn, schema_sql_name, category.key, current_page + 1)
@@ -1303,7 +1303,7 @@ local function open_schema_browser(conn, schema_name, category_key, page)
           end)
         end
         if current_page > 1 then
-          map("<C-b>", function()
+          map("<C-e>", function()
             actions.close(prompt_bufnr)
             vim.schedule(function()
               open_schema_browser(conn, schema_sql_name, category.key, current_page - 1)
