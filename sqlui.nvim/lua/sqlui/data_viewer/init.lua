@@ -5,14 +5,20 @@ local state = require("sqlui.state")
 local M = {}
 
 local viewers = {}
-local page_size = 100
+local default_page_size = 100
+local max_col_width = 40
+local page_size_options = { 25, 50, 100, 250, 500 }
 
 local function trim(value)
   return vim.trim(value or "")
 end
 
 local function notify(msg, level)
-  vim.notify(msg, level or vim.log.levels.INFO, { title = "sqlui" })
+  local safe_msg = tostring(msg or "sqlui: erro desconhecido")
+  local ok = pcall(vim.notify, safe_msg, level or vim.log.levels.INFO, { title = "sqlui" })
+  if not ok then
+    vim.notify(safe_msg, level or vim.log.levels.INFO)
+  end
 end
 
 local function usql_bin()
@@ -39,6 +45,9 @@ local function driver_from_dsn(dsn)
   if scheme == "mssql" or scheme == "sqlserver" then
     return "mssql"
   end
+  if scheme == "sqlite3" or scheme == "sqlite" or scheme == "file" then
+    return "sqlite"
+  end
   return scheme ~= "" and scheme or "mssql"
 end
 
@@ -47,8 +56,9 @@ local function quote_ident(driver, value)
     return "`" .. tostring(value):gsub("`", "``") .. "`"
   end
   if driver == "mssql" then
-    return "[" .. tostring(value):gsub("]", "]]" ) .. "]"
+    return "[" .. tostring(value):gsub("]", "]]") .. "]"
   end
+  -- postgres, sqlite, and others use double-quote
   return '"' .. tostring(value):gsub('"', '""') .. '"'
 end
 
@@ -57,6 +67,10 @@ local function escape_sql_string(value)
 end
 
 local function object_ref(driver, schema_name, object_name)
+  if driver == "sqlite" then
+    -- SQLite: just table name is sufficient; "main"."table" also works but is unnecessary
+    return quote_ident(driver, object_name)
+  end
   return string.format("%s.%s", quote_ident(driver, schema_name), quote_ident(driver, object_name))
 end
 
@@ -113,18 +127,23 @@ local function resolve_connection(on_ready)
 end
 
 local function column_query(driver, schema_name, object_name)
+  if driver == "sqlite" then
+    return string.format("PRAGMA table_info('%s')", escape_sql_string(object_name))
+  end
   local where = string.format(
     "TABLE_SCHEMA = '%s' and TABLE_NAME = '%s'",
     escape_sql_string(schema_name),
     escape_sql_string(object_name)
   )
-  if driver == "mssql" or driver == "postgres" or driver == "mysql" then
-    return "select COLUMN_NAME, DATA_TYPE, ORDINAL_POSITION from INFORMATION_SCHEMA.COLUMNS where " .. where .. " order by ORDINAL_POSITION"
-  end
   return "select COLUMN_NAME, DATA_TYPE, ORDINAL_POSITION from INFORMATION_SCHEMA.COLUMNS where " .. where .. " order by ORDINAL_POSITION"
 end
 
-local function primary_key_query(schema_name, object_name)
+local function primary_key_query(driver, schema_name, object_name)
+  if driver == "sqlite" then
+    -- PRAGMA table_info returns `pk` field (> 0 for PK columns)
+    -- We can't filter PRAGMAs with WHERE, so we'll handle filtering in Lua
+    return string.format("PRAGMA table_info('%s')", escape_sql_string(object_name))
+  end
   return string.format(
     [[select kcu.COLUMN_NAME, kcu.ORDINAL_POSITION
 from INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
@@ -142,31 +161,53 @@ order by kcu.ORDINAL_POSITION]],
 end
 
 local function discover_columns(conn, schema_name, object_name)
-  local rows, err = run_usql_json(conn, column_query(driver_from_dsn(conn.dsn), schema_name, object_name))
+  local driver = driver_from_dsn(conn.dsn)
+  local rows, err = run_usql_json(conn, column_query(driver, schema_name, object_name))
   if not rows then
     return nil, err
   end
 
   local columns = {}
-  for _, row in ipairs(rows) do
-    table.insert(columns, {
-      name = row.COLUMN_NAME or row.column_name,
-      data_type = row.DATA_TYPE or row.data_type,
-      ordinal = row.ORDINAL_POSITION or row.ordinal_position,
-    })
+  if driver == "sqlite" then
+    for _, row in ipairs(rows) do
+      table.insert(columns, {
+        name = row.name or row.NAME,
+        data_type = row.type or row.TYPE or "TEXT",
+        ordinal = row.cid or row.CID,
+      })
+    end
+  else
+    for _, row in ipairs(rows) do
+      table.insert(columns, {
+        name = row.COLUMN_NAME or row.column_name,
+        data_type = row.DATA_TYPE or row.data_type,
+        ordinal = row.ORDINAL_POSITION or row.ordinal_position,
+      })
+    end
   end
   return columns, nil
 end
 
 local function discover_primary_key(conn, schema_name, object_name)
-  local rows = run_usql_json(conn, primary_key_query(schema_name, object_name))
+  local driver = driver_from_dsn(conn.dsn)
+  local rows = run_usql_json(conn, primary_key_query(driver, schema_name, object_name))
   if type(rows) ~= "table" then
     return {}
   end
 
   local columns = {}
-  for _, row in ipairs(rows) do
-    table.insert(columns, row.COLUMN_NAME or row.column_name)
+  if driver == "sqlite" then
+    -- PRAGMA table_info returns all columns; filter where pk > 0
+    for _, row in ipairs(rows) do
+      local pk = tonumber(row.pk or row.PK or 0) or 0
+      if pk > 0 then
+        table.insert(columns, row.name or row.NAME)
+      end
+    end
+  else
+    for _, row in ipairs(rows) do
+      table.insert(columns, row.COLUMN_NAME or row.column_name)
+    end
   end
   return columns
 end
@@ -208,7 +249,11 @@ local function build_filter_clause(driver, filter_text)
 
     local quoted = quote_ident(driver, column)
     if op == "~" then
-      table.insert(clauses, string.format("%s LIKE '%%%s%%'", quoted, escape_sql_string(value)))
+      local like_target = driver == "postgres"
+        and string.format("CAST(%s AS text)", quoted)
+        or quoted
+      local like_op = driver == "postgres" and "ILIKE" or "LIKE"
+      table.insert(clauses, string.format("%s %s '%%%s%%'", like_target, like_op, escape_sql_string(value)))
     else
       local literal, is_null = sql_literal(value)
       if is_null then
@@ -267,12 +312,12 @@ end
 local function fetch_page(ctx)
   local sql, err = build_page_query(ctx)
   if not sql then
-    return nil, err
+    return nil, nil, err
   end
 
   local rows, query_err = run_usql_json(ctx.conn, sql)
   if not rows then
-    return nil, query_err
+    return nil, nil, query_err
   end
 
   local has_next = #rows > ctx.page_size
@@ -288,76 +333,157 @@ local function fetch_page(ctx)
   return normalized, has_next, nil
 end
 
-local function format_cell(value)
+-- ---------------------------------------------------------------------------
+-- Rendering
+-- ---------------------------------------------------------------------------
+
+local function format_cell(value, width)
+  local text
   if value == nil then
-    return "NULL"
+    text = "NULL"
+  else
+    text = tostring(value):gsub("\r\n", " "):gsub("\n", " ")
   end
-  local text = tostring(value):gsub("\r\n", " "):gsub("\n", " ")
-  if #text > 40 then
-    return text:sub(1, 37) .. "..."
+  if #text > width then
+    return text:sub(1, width - 3) .. "..."
   end
   return text
 end
 
-local function render_table(ctx)
+local function compute_widths(columns, rows)
   local widths = {}
-  for _, col in ipairs(ctx.columns) do
-    widths[col.name] = math.min(math.max(#tostring(col.name), 8), 24)
+  for _, col in ipairs(columns) do
+    widths[col.name] = math.max(#tostring(col.name), 4)
   end
-
-  for _, row in ipairs(ctx.rows or {}) do
-    for _, col in ipairs(ctx.columns) do
-      widths[col.name] = math.min(math.max(widths[col.name], #format_cell(row[col.name])), 24)
+  for _, row in ipairs(rows or {}) do
+    for _, col in ipairs(columns) do
+      local raw = row[col.name]
+      local len
+      if raw == nil then
+        len = 4 -- "NULL"
+      else
+        len = #tostring(raw):gsub("\r\n", " "):gsub("\n", " ")
+      end
+      widths[col.name] = math.max(widths[col.name], len)
     end
   end
-
-  local function line_from_row(map)
-    local parts = {}
-    for _, col in ipairs(ctx.columns) do
-      local text = map[col.name] or col.name
-      table.insert(parts, string.format("%-" .. widths[col.name] .. "s", text))
-    end
-    return table.concat(parts, " | ")
+  -- cap each column to max_col_width
+  for name, w in pairs(widths) do
+    widths[name] = math.min(w, max_col_width)
   end
+  return widths
+end
 
+local function line_from_row(columns, widths, map)
+  local parts = {}
+  for _, col in ipairs(columns) do
+    local w = widths[col.name]
+    local text = format_cell(map[col.name], w)
+    table.insert(parts, string.format("%-" .. w .. "s", text))
+  end
+  return table.concat(parts, " | ")
+end
+
+local function build_header_lines(ctx, widths)
   local header_map = {}
   for _, col in ipairs(ctx.columns) do
     header_map[col.name] = col.name
   end
 
-  local header = line_from_row(header_map)
+  local header = line_from_row(ctx.columns, widths, header_map)
   local separator = string.rep("-", #header)
-  local lines = {
-    string.format("%s.%s", ctx.schema_name, ctx.object_name),
-    string.format("Pagina: %d | Ordem: %s | Filtro: %s", ctx.page, ctx.order_by, trim(ctx.filter) ~= "" and ctx.filter or "<nenhum>"),
-    string.format("Atalhos: ]p proxima | [p anterior | ff filtro | fo ordenar | r recarregar | q fechar"),
-    "",
+
+  return {
+    string.format(
+      "%s.%s  |  Pag: %d  |  Linhas/pag: %d  |  Ordem: %s  |  Filtro: %s",
+      ctx.schema_name,
+      ctx.object_name,
+      ctx.page,
+      ctx.page_size,
+      ctx.order_by,
+      trim(ctx.filter) ~= "" and ctx.filter or "<nenhum>"
+    ),
+    "Atalhos: ]p prox | [p ant | ff filtro | fc limpar | fo ordenar | fp linhas/pag | r recarregar | q fechar",
     header,
     separator,
   }
+end
 
+local function build_data_lines(ctx, widths)
+  local lines = {}
   for _, row in ipairs(ctx.rows or {}) do
-    local row_map = {}
-    for _, col in ipairs(ctx.columns) do
-      row_map[col.name] = format_cell(row[col.name])
-    end
-    table.insert(lines, line_from_row(row_map))
+    table.insert(lines, line_from_row(ctx.columns, widths, row))
   end
-
   if vim.tbl_isempty(ctx.rows or {}) then
     table.insert(lines, "<sem linhas nesta pagina>")
   end
-
   if ctx.has_next then
     table.insert(lines, "")
-    table.insert(lines, "Existe proxima pagina.")
+    table.insert(lines, "-- proxima pagina disponivel (]p) --")
   end
-
   return lines
 end
 
-local function refresh_viewer(bufnr)
-  local ctx = viewers[bufnr]
+-- ---------------------------------------------------------------------------
+-- Split-window viewer (fixed header)
+-- ---------------------------------------------------------------------------
+
+local function set_buf_opts(bufnr)
+  vim.bo[bufnr].buftype = "nofile"
+  vim.bo[bufnr].bufhidden = "wipe"
+  vim.bo[bufnr].swapfile = false
+  vim.bo[bufnr].filetype = "sqlui_viewer"
+end
+
+local function set_win_opts(winid)
+  vim.wo[winid].wrap = false
+  vim.wo[winid].number = false
+  vim.wo[winid].relativenumber = false
+  vim.wo[winid].signcolumn = "no"
+  vim.wo[winid].cursorline = false
+  vim.wo[winid].foldcolumn = "0"
+  vim.wo[winid].winfixheight = true
+end
+
+local function write_buf(bufnr, lines)
+  vim.bo[bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  vim.bo[bufnr].modifiable = false
+  vim.bo[bufnr].readonly = true
+end
+
+local function sync_header_scroll(header_win, data_win)
+  if not vim.api.nvim_win_is_valid(header_win) or not vim.api.nvim_win_is_valid(data_win) then
+    return
+  end
+  local data_view = vim.api.nvim_win_call(data_win, function()
+    return vim.fn.winsaveview()
+  end)
+  vim.api.nvim_win_call(header_win, function()
+    vim.fn.winrestview({ leftcol = data_view.leftcol })
+  end)
+end
+
+--- Create a per-viewer throttled scroll sync (50ms debounce).
+--- Each viewer gets its own timer to avoid cross-view contention.
+local function make_throttled_scroll_sync(data_bufnr)
+  local timer = nil
+  return function(header_win, data_win)
+    if timer then
+      timer:stop()
+    end
+    timer = vim.defer_fn(function()
+      timer = nil
+      -- Guard: viewer may have been closed during debounce
+      if viewers[data_bufnr] then
+        sync_header_scroll(header_win, data_win)
+      end
+    end, 50)
+  end
+end
+
+local function refresh_viewer(data_bufnr)
+  local ctx = viewers[data_bufnr]
   if not ctx then
     return
   end
@@ -371,61 +497,86 @@ local function refresh_viewer(bufnr)
   ctx.rows = rows
   ctx.has_next = has_next
 
-  vim.bo[bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, render_table(ctx))
-  vim.bo[bufnr].modifiable = false
-  vim.bo[bufnr].readonly = true
+  local widths = compute_widths(ctx.columns, ctx.rows)
+  ctx._widths = widths
+
+  write_buf(ctx.header_buf, build_header_lines(ctx, widths))
+  write_buf(data_bufnr, build_data_lines(ctx, widths))
+
+  -- resize header window to exactly 4 lines (info + shortcuts + header + separator)
+  if vim.api.nvim_win_is_valid(ctx.header_win) then
+    vim.api.nvim_win_set_height(ctx.header_win, 4)
+  end
 end
 
-local function set_viewer_maps(bufnr)
+local function close_viewer(data_bufnr)
+  local ctx = viewers[data_bufnr]
+  if not ctx then
+    return
+  end
+  -- close the whole tab
+  local tab = ctx.tab
+  if tab and vim.api.nvim_tabpage_is_valid(tab) then
+    -- delete both buffers, tab will close
+    local bufs = { ctx.header_buf, data_bufnr }
+    for _, b in ipairs(bufs) do
+      if vim.api.nvim_buf_is_valid(b) then
+        vim.api.nvim_buf_delete(b, { force = true })
+      end
+    end
+  end
+  viewers[data_bufnr] = nil
+end
+
+local function set_viewer_maps(data_bufnr)
   local function map(lhs, rhs, desc)
-    vim.keymap.set("n", lhs, rhs, { buffer = bufnr, silent = true, desc = desc })
+    vim.keymap.set("n", lhs, rhs, { buffer = data_bufnr, silent = true, desc = desc })
   end
 
   map("]p", function()
-    local ctx = viewers[bufnr]
+    local ctx = viewers[data_bufnr]
     if not ctx or not ctx.has_next then
       notify("nao ha proxima pagina", vim.log.levels.WARN)
       return
     end
     ctx.page = ctx.page + 1
-    refresh_viewer(bufnr)
+    refresh_viewer(data_bufnr)
   end, "sqlui next page")
 
   map("[p", function()
-    local ctx = viewers[bufnr]
+    local ctx = viewers[data_bufnr]
     if not ctx or ctx.page <= 1 then
       notify("ja esta na primeira pagina", vim.log.levels.WARN)
       return
     end
     ctx.page = ctx.page - 1
-    refresh_viewer(bufnr)
+    refresh_viewer(data_bufnr)
   end, "sqlui previous page")
 
   map("ff", function()
-    local ctx = viewers[bufnr]
+    local ctx = viewers[data_bufnr]
     if not ctx then
       return
     end
     picker.input({ prompt = "Filtro (coluna=valor;coluna2~valor): ", default = ctx.filter or "" }, function(value)
       ctx.filter = trim(value)
       ctx.page = 1
-      refresh_viewer(bufnr)
+      refresh_viewer(data_bufnr)
     end)
   end, "sqlui set filter")
 
   map("fc", function()
-    local ctx = viewers[bufnr]
+    local ctx = viewers[data_bufnr]
     if not ctx then
       return
     end
     ctx.filter = ""
     ctx.page = 1
-    refresh_viewer(bufnr)
+    refresh_viewer(data_bufnr)
   end, "sqlui clear filter")
 
   map("fo", function()
-    local ctx = viewers[bufnr]
+    local ctx = viewers[data_bufnr]
     if not ctx then
       return
     end
@@ -440,40 +591,131 @@ local function set_viewer_maps(bufnr)
       end
       ctx.order_by = choice.name
       ctx.page = 1
-      refresh_viewer(bufnr)
+      refresh_viewer(data_bufnr)
     end)
   end, "sqlui change order")
 
+  map("fp", function()
+    local ctx = viewers[data_bufnr]
+    if not ctx then
+      return
+    end
+    local items = {}
+    for _, size in ipairs(page_size_options) do
+      local label = tostring(size)
+      if size == ctx.page_size then
+        label = label .. " (atual)"
+      end
+      table.insert(items, { label = label, value = size })
+    end
+    picker.select(items, {
+      prompt = "Linhas por pagina",
+      format_item = function(item)
+        return item.label
+      end,
+    }, function(choice)
+      if not choice then
+        return
+      end
+      ctx.page_size = choice.value
+      ctx.page = 1
+      refresh_viewer(data_bufnr)
+    end)
+  end, "sqlui change page size")
+
   map("r", function()
-    refresh_viewer(bufnr)
+    refresh_viewer(data_bufnr)
   end, "sqlui refresh")
 
   map("q", function()
-    if vim.api.nvim_buf_is_valid(bufnr) then
-      vim.api.nvim_buf_delete(bufnr, { force = true })
-    end
+    close_viewer(data_bufnr)
   end, "sqlui close viewer")
 end
 
 local function open_viewer(ctx)
   vim.cmd("tabnew")
-  local buf = vim.api.nvim_get_current_buf()
-  viewers[buf] = ctx
-  vim.bo[buf].buftype = "nofile"
-  vim.bo[buf].bufhidden = "wipe"
-  vim.bo[buf].swapfile = false
-  vim.bo[buf].filetype = "sql"
-  vim.wo.wrap = false
-  vim.wo.number = false
-  vim.wo.relativenumber = false
-  vim.wo.signcolumn = "no"
-  set_viewer_maps(buf)
-  refresh_viewer(buf)
+  local tab = vim.api.nvim_get_current_tabpage()
 
-  vim.api.nvim_create_autocmd("BufWipeout", {
-    buffer = buf,
+  -- The tabnew created one window; we'll use it for the header
+  local header_win = vim.api.nvim_get_current_win()
+  local header_buf = vim.api.nvim_get_current_buf()
+
+  set_buf_opts(header_buf)
+
+  -- Create the data buffer + window below the header
+  vim.cmd("belowright new")
+  local data_win = vim.api.nvim_get_current_win()
+  local data_buf = vim.api.nvim_get_current_buf()
+  set_buf_opts(data_buf)
+
+  -- Configure windows
+  set_win_opts(header_win)
+  set_win_opts(data_win)
+  vim.wo[data_win].cursorline = true
+
+  -- Header is fixed height (4 lines)
+  vim.api.nvim_win_set_height(header_win, 4)
+
+  -- Store context keyed by data buffer
+  ctx.header_buf = header_buf
+  ctx.header_win = header_win
+  ctx.data_win = data_win
+  ctx.tab = tab
+  viewers[data_buf] = ctx
+
+  -- Focus the data window
+  vim.api.nvim_set_current_win(data_win)
+
+  set_viewer_maps(data_buf)
+  refresh_viewer(data_buf)
+
+  -- Per-viewer throttled scroll sync (avoids cross-view timer contention)
+  local throttled_scroll = make_throttled_scroll_sync(data_buf)
+
+  -- Sync horizontal scroll: when cursor moves in data, update header leftcol (throttled)
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "WinScrolled" }, {
+    buffer = data_buf,
     callback = function()
-      viewers[buf] = nil
+      local c = viewers[data_buf]
+      if c then
+        throttled_scroll(c.header_win, c.data_win)
+      end
+    end,
+  })
+
+  -- Cleanup on data buffer wipe
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = data_buf,
+    callback = function()
+      local c = viewers[data_buf]
+      if c and vim.api.nvim_buf_is_valid(c.header_buf) then
+        pcall(vim.api.nvim_buf_delete, c.header_buf, { force = true })
+      end
+      viewers[data_buf] = nil
+    end,
+  })
+
+  -- Cleanup on header buffer wipe
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = header_buf,
+    callback = function()
+      if vim.api.nvim_buf_is_valid(data_buf) then
+        pcall(vim.api.nvim_buf_delete, data_buf, { force = true })
+      end
+      viewers[data_buf] = nil
+    end,
+  })
+
+  -- Prevent focus on the header window — redirect to data window
+  vim.api.nvim_create_autocmd("WinEnter", {
+    callback = function()
+      local c = viewers[data_buf]
+      if not c then
+        return true -- remove autocmd
+      end
+      if vim.api.nvim_get_current_win() == c.header_win and vim.api.nvim_win_is_valid(c.data_win) then
+        vim.api.nvim_set_current_win(c.data_win)
+      end
     end,
   })
 end
@@ -504,7 +746,7 @@ function M.open_for_item(conn, item)
     order_by = order_by,
     filter = "",
     page = 1,
-    page_size = page_size,
+    page_size = default_page_size,
     rows = {},
     has_next = false,
   })

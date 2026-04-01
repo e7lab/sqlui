@@ -17,11 +17,9 @@ M.defaults = {
   cache = {
     enabled = true,
     persistent = true,
-    batch_size = 200,
-    preload_columns = false,
     schema_object_limit = 30,
+    schema_page_size = 15,
     debounce_ms = 300,
-    live_search_min_chars = 3,
     routine_preview_line_limit = 40,
   },
   history = {
