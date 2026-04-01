@@ -6,8 +6,6 @@ local state = require("sqlui.state")
 
 local M = {}
 
-local schema_list_items
-
 local session = {
   schema_stats = {},
   schema_cache = {},
@@ -18,21 +16,25 @@ local schema_categories = {
     key = "tables",
     label = "Tabelas",
     list_sql = "select TABLE_SCHEMA, TABLE_NAME from INFORMATION_SCHEMA.TABLES where TABLE_TYPE = 'BASE TABLE' order by TABLE_SCHEMA, TABLE_NAME",
+    list_sql_sqlite = "select 'main' as TABLE_SCHEMA, name as TABLE_NAME from sqlite_master where type = 'table' and name not like 'sqlite_%' order by name",
   },
   {
     key = "views",
     label = "Views",
     list_sql = "select TABLE_SCHEMA, TABLE_NAME from INFORMATION_SCHEMA.VIEWS order by TABLE_SCHEMA, TABLE_NAME",
+    list_sql_sqlite = "select 'main' as TABLE_SCHEMA, name as TABLE_NAME from sqlite_master where type = 'view' order by name",
   },
   {
     key = "functions",
     label = "Functions",
     list_sql = "select ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE from INFORMATION_SCHEMA.ROUTINES where ROUTINE_TYPE = 'FUNCTION' order by ROUTINE_SCHEMA, ROUTINE_NAME",
+    list_sql_sqlite = nil,
   },
   {
     key = "procedures",
     label = "Procedures",
     list_sql = "select ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE from INFORMATION_SCHEMA.ROUTINES where ROUTINE_TYPE = 'PROCEDURE' order by ROUTINE_SCHEMA, ROUTINE_NAME",
+    list_sql_sqlite = nil,
   },
 }
 
@@ -48,7 +50,11 @@ local function trim(value)
 end
 
 local function notify(msg, level)
-  vim.notify(msg, level or vim.log.levels.INFO, { title = "sqlui" })
+  local safe_msg = tostring(msg or "sqlui: erro desconhecido")
+  local ok = pcall(vim.notify, safe_msg, level or vim.log.levels.INFO, { title = "sqlui" })
+  if not ok then
+    vim.notify(safe_msg, level or vim.log.levels.INFO)
+  end
 end
 
 local function cache_config()
@@ -56,32 +62,16 @@ local function cache_config()
   return config.cache or {}
 end
 
-local function schema_object_limit()
-  return cache_config().schema_object_limit or 30
+local function schema_page_size()
+  return cache_config().schema_page_size or 15
 end
 
 local function schema_live_search_debounce_ms()
   return cache_config().debounce_ms or 300
 end
 
-local function schema_live_search_min_chars()
-  return cache_config().live_search_min_chars or 3
-end
-
 local function routine_preview_line_limit()
   return cache_config().routine_preview_line_limit or 40
-end
-
-local function should_preload_columns()
-  return cache_config().preload_columns == true
-end
-
-local function schema_batch_size()
-  local value = tonumber(cache_config().batch_size)
-  if value and value > 0 then
-    return math.floor(value)
-  end
-  return 200
 end
 
 local function usql_bin()
@@ -363,26 +353,17 @@ local function connection_with_cache(conn, cache)
   return enriched
 end
 
-local function empty_schema_bundle(schema_name)
-  return {
-    schema = schema_name,
-    objects = { tables = {}, views = {}, functions = {}, procedures = {} },
-    columns = {},
-    complete = {
-      tables = false,
-      views = false,
-      functions = false,
-      procedures = false,
-    },
-  }
-end
-
 local function upsert_persistent_schema_objects(alias, schema_name, category_key, items, is_complete)
   if trim(alias) == "" or alias == "temporaria" then
     return
   end
 
-  local bundle = load_persistent_bundle(alias, schema_name) or empty_schema_bundle(schema_name)
+  local bundle = load_persistent_bundle(alias, schema_name) or {
+    schema = schema_name,
+    objects = { tables = {}, views = {}, functions = {}, procedures = {} },
+    columns = {},
+    complete = {},
+  }
 
   bundle.objects = bundle.objects or { tables = {}, views = {}, functions = {}, procedures = {} }
   bundle.columns = bundle.columns or {}
@@ -400,7 +381,6 @@ local function upsert_persistent_schema_objects(alias, schema_name, category_key
   local manifest = ensure_persistent_manifest(alias)
   manifest.built_at = os.date("%Y-%m-%d %H:%M:%S")
   manifest.schemas = sorted_schema_stats()
-  manifest.partial = true
   save_persistent_manifest(alias, manifest)
   return manifest
 end
@@ -410,7 +390,12 @@ local function upsert_persistent_schema_columns(alias, schema_name, object_name,
     return
   end
 
-  local bundle = load_persistent_bundle(alias, schema_name) or empty_schema_bundle(schema_name)
+  local bundle = load_persistent_bundle(alias, schema_name) or {
+    schema = schema_name,
+    objects = { tables = {}, views = {}, functions = {}, procedures = {} },
+    columns = {},
+    complete = {},
+  }
 
   bundle.objects = bundle.objects or { tables = {}, views = {}, functions = {}, procedures = {} }
   bundle.columns = bundle.columns or {}
@@ -423,18 +408,70 @@ local function upsert_persistent_schema_columns(alias, schema_name, object_name,
   local manifest = ensure_persistent_manifest(alias)
   manifest.built_at = os.date("%Y-%m-%d %H:%M:%S")
   manifest.schemas = sorted_schema_stats()
-  manifest.partial = true
   save_persistent_manifest(alias, manifest)
   return manifest
 end
 
 local function list_schemas(dsn)
-  local sql = [[
-select s.name as schema_name
+  local driver = connection.detect_driver(dsn)
+
+  local schema_queries = {
+    mssql = [[
+select
+  s.name as schema_name,
+  sum(case when o.type = 'U' then 1 else 0 end) as tables_count,
+  sum(case when o.type = 'V' then 1 else 0 end) as views_count,
+  sum(case when o.type in ('FN','IF','TF','FS','FT') then 1 else 0 end) as functions_count,
+  sum(case when o.type in ('P','PC') then 1 else 0 end) as procedures_count
 from sys.schemas s
-where s.name not in ('sys', 'INFORMATION_SCHEMA')
+left join sys.objects o
+  on o.schema_id = s.schema_id
+ and o.is_ms_shipped = 0
+group by s.name
 order by s.name
-]]
+]],
+    postgres = [[
+select
+  n.nspname as schema_name,
+  count(*) filter (where c.relkind = 'r') as tables_count,
+  count(*) filter (where c.relkind = 'v') as views_count,
+  count(*) filter (where c.relkind = 'f') as functions_count,
+  0 as procedures_count
+from pg_namespace n
+left join pg_class c
+  on c.relnamespace = n.oid
+ and c.relkind in ('r','v','f')
+where n.nspname !~ '^pg_'
+  and n.nspname <> 'information_schema'
+group by n.nspname
+order by n.nspname
+]],
+    mysql = [[
+select
+  table_schema as schema_name,
+  sum(case when table_type = 'BASE TABLE' then 1 else 0 end) as tables_count,
+  sum(case when table_type = 'VIEW' then 1 else 0 end) as views_count,
+  0 as functions_count,
+  0 as procedures_count
+from information_schema.tables
+where table_schema not in ('information_schema','mysql','performance_schema','sys')
+group by table_schema
+order by table_schema
+]],
+    sqlite = [[
+select
+  'main' as schema_name,
+  (select count(*) from sqlite_master where type = 'table' and name not like 'sqlite_%') as tables_count,
+  (select count(*) from sqlite_master where type = 'view') as views_count,
+  0 as functions_count,
+  0 as procedures_count
+]],
+  }
+
+  local sql = schema_queries[driver]
+  if not sql then
+    return nil, "driver '" .. driver .. "' nao suportado para listagem de schemas"
+  end
 
   local rows, err = run_usql_json(dsn, sql)
   if not rows then
@@ -446,10 +483,10 @@ order by s.name
   for _, row in ipairs(rows) do
     local item = {
       name = row_field(row, "schema_name", "SCHEMA_NAME", "schemaName") or "<schema>",
-      tables_count = tonumber(row_field(row, "tables_count", "TABLES_COUNT", "tablesCount")),
-      views_count = tonumber(row_field(row, "views_count", "VIEWS_COUNT", "viewsCount")),
-      functions_count = tonumber(row_field(row, "functions_count", "FUNCTIONS_COUNT", "functionsCount")),
-      procedures_count = tonumber(row_field(row, "procedures_count", "PROCEDURES_COUNT", "proceduresCount")),
+      tables_count = tonumber(row_field(row, "tables_count", "TABLES_COUNT", "tablesCount") or 0) or 0,
+      views_count = tonumber(row_field(row, "views_count", "VIEWS_COUNT", "viewsCount") or 0) or 0,
+      functions_count = tonumber(row_field(row, "functions_count", "FUNCTIONS_COUNT", "functionsCount") or 0) or 0,
+      procedures_count = tonumber(row_field(row, "procedures_count", "PROCEDURES_COUNT", "proceduresCount") or 0) or 0,
     }
     table.insert(items, item)
     session.schema_stats[item.name] = item
@@ -479,18 +516,6 @@ local function schema_category_count(schema_name, category_key)
   return tonumber(stats[field] or 0) or 0
 end
 
-local function schema_category_has_unknown_count(schema_name, category_key)
-  local stats = session.schema_stats[schema_name]
-  if not stats then
-    return true
-  end
-  local field = schema_count_field_by_category[category_key]
-  if not field then
-    return true
-  end
-  return stats[field] == nil
-end
-
 local function group_items_by_schema(items)
   local grouped = {}
   for _, item in ipairs(items or {}) do
@@ -502,6 +527,41 @@ local function group_items_by_schema(items)
 end
 
 local function build_columns_cache_for_schema(dsn, schema_name)
+  local driver = connection.detect_driver(dsn)
+
+  if driver == "sqlite" then
+    -- SQLite: list all tables, then PRAGMA table_info() for each (capped at 200)
+    local tables_rows, tables_err = run_usql_json(
+      dsn,
+      "select name from sqlite_master where type in ('table','view') and name not like 'sqlite_%' order by name limit 200"
+    )
+    if not tables_rows then
+      return nil, tables_err
+    end
+
+    local grouped = {}
+    for _, tbl_row in ipairs(tables_rows) do
+      local tbl_name = row_field(tbl_row, "name", "NAME") or "<table>"
+      local cols, cols_err = run_usql_json(dsn, string.format("PRAGMA table_info('%s')", escape_sql_string(tbl_name)))
+      if cols then
+        grouped[tbl_name] = {}
+        for _, col in ipairs(cols) do
+          table.insert(grouped[tbl_name], {
+            ordinal_position = row_field(col, "cid", "CID"),
+            column_name = row_field(col, "name", "NAME"),
+            data_type = row_field(col, "type", "TYPE") or "TEXT",
+          })
+        end
+      elseif cols_err then
+        notify("colunas nao carregadas para '" .. tbl_name .. "'", vim.log.levels.WARN)
+      end
+    end
+    if #tables_rows >= 200 then
+      notify("cache de colunas limitado a 200 tabelas SQLite", vim.log.levels.WARN)
+    end
+    return grouped, nil
+  end
+
   local rows, err = run_usql_json(
     dsn,
     string.format(
@@ -527,102 +587,86 @@ local function build_columns_cache_for_schema(dsn, schema_name)
   return grouped, nil
 end
 
-local function build_schema_list_sql(category, schema_name, search_term, limit, offset)
-  local sql = category.list_sql
-  local clauses = {}
-
-  if trim(schema_name) ~= "" then
-    if category.key == "functions" or category.key == "procedures" then
-      table.insert(clauses, string.format("ROUTINE_SCHEMA = '%s'", escape_sql_string(schema_name)))
-    else
-      table.insert(clauses, string.format("TABLE_SCHEMA = '%s'", escape_sql_string(schema_name)))
-    end
-  end
-
-  if trim(search_term) ~= "" then
-    local pattern = escape_sql_string(search_term) .. "%%%"
-    if category.key == "functions" or category.key == "procedures" then
-      table.insert(clauses, string.format("ROUTINE_NAME like '%s'", pattern))
-    else
-      table.insert(clauses, string.format("TABLE_NAME like '%s'", pattern))
-    end
-  end
-
-  if #clauses > 0 then
-    local where_sql = table.concat(clauses, " and ")
-    if sql:lower():find(" where ", 1, true) then
-      sql = sql:gsub(" [Oo][Rr][Dd][Ee][Rr] [Bb][Yy] ", " and " .. where_sql .. " order by ", 1)
-    else
-      sql = sql:gsub(" [Oo][Rr][Dd][Ee][Rr] [Bb][Yy] ", " where " .. where_sql .. " order by ", 1)
-    end
-  end
-
-  if offset and offset > 0 then
-    sql = string.format("%s offset %d rows", sql, offset)
-    if limit and limit > 0 then
-      sql = string.format("%s fetch next %d rows only", sql, limit)
-    end
-    return sql
-  end
-
-  if limit and limit > 0 then
-    sql = sql:gsub("^[Ss][Ee][Ll][Ee][Cc][Tt]%s+", "select top " .. tostring(limit) .. " ", 1)
-  end
-
-  return sql
-end
-
-local function fetch_schema_category_in_batches(dsn, category, schema_name)
-  local all_items = {}
-  local offset = 0
-  local page_size = schema_batch_size()
-
-  while true do
-    local rows, err = run_usql_json(dsn, build_schema_list_sql(category, schema_name, nil, page_size, offset))
-    if not rows then
-      return nil, err
-    end
-
-    local items = {}
-    for _, row in ipairs(rows) do
-      local table_schema = row_field(row, "TABLE_SCHEMA", "table_schema", "tableSchema")
-      local table_name = row_field(row, "TABLE_NAME", "table_name", "tableName")
-      local routine_schema = row_field(row, "ROUTINE_SCHEMA", "routine_schema", "routineSchema")
-      local routine_name = row_field(row, "ROUTINE_NAME", "routine_name", "routineName")
-      local routine_type = row_field(row, "ROUTINE_TYPE", "routine_type", "routineType")
-
-      if category.key == "functions" or category.key == "procedures" then
-        table.insert(items, {
-          schema = routine_schema,
-          name = routine_name,
-          type = routine_type,
-        })
-      else
-        table.insert(items, {
-          schema = table_schema,
-          name = table_name,
-          type = category.key == "tables" and "TABLE" or "VIEW",
-        })
-      end
-    end
-
-    all_items = merge_named_items(all_items, items)
-    if #items < page_size then
-      break
-    end
-    offset = offset + page_size
-  end
-
-  return all_items, nil
-end
-
-schema_list_items = function(dsn, category, schema_name, search_term, limit)
-  local cache_key = table.concat({ dsn, category.key, schema_name or "", search_term or "", tostring(limit or "") }, "::")
+local function schema_list_items(dsn, category, schema_name, search_term, limit, offset)
+  local driver = connection.detect_driver(dsn)
+  local cache_key = table.concat({ dsn, category.key, schema_name or "", search_term or "", tostring(limit or ""), tostring(offset or "") }, "::")
   if session.schema_cache[cache_key] then
     return vim.deepcopy(session.schema_cache[cache_key]), nil
   end
 
-  local sql = build_schema_list_sql(category, schema_name, search_term, limit, nil)
+  -- SQLite: no functions/procedures
+  if driver == "sqlite" and (category.key == "functions" or category.key == "procedures") then
+    session.schema_cache[cache_key] = {}
+    return {}, nil
+  end
+
+  local sql = driver == "sqlite" and category.list_sql_sqlite or category.list_sql
+  if not sql then
+    session.schema_cache[cache_key] = {}
+    return {}, nil
+  end
+
+  if driver == "sqlite" then
+    -- SQLite: filtering is done via LIKE on `name` column in sqlite_master
+    if trim(search_term) ~= "" then
+      local pattern = escape_sql_string(search_term) .. "%"
+      if sql:lower():find(" order by ", 1, true) then
+        sql = sql:gsub(" [Oo][Rr][Dd][Ee][Rr] [Bb][Yy] ", " and name like '" .. pattern .. "' order by ", 1)
+      else
+        sql = sql .. " and name like '" .. pattern .. "'"
+      end
+    end
+    if limit and limit > 0 then
+      sql = sql .. " limit " .. tostring(limit)
+      if offset and offset > 0 then
+        sql = sql .. " offset " .. tostring(offset)
+      end
+    end
+  else
+    local clauses = {}
+
+    if trim(schema_name) ~= "" then
+      if category.key == "functions" or category.key == "procedures" then
+        table.insert(clauses, string.format("ROUTINE_SCHEMA = '%s'", escape_sql_string(schema_name)))
+      else
+        table.insert(clauses, string.format("TABLE_SCHEMA = '%s'", escape_sql_string(schema_name)))
+      end
+    end
+
+    if trim(search_term) ~= "" then
+      local pattern = escape_sql_string(search_term) .. "%%%"
+      if category.key == "functions" or category.key == "procedures" then
+        table.insert(clauses, string.format("ROUTINE_NAME like '%s'", pattern))
+      else
+        table.insert(clauses, string.format("TABLE_NAME like '%s'", pattern))
+      end
+    end
+
+    if #clauses > 0 then
+      local where_sql = table.concat(clauses, " and ")
+      if sql:lower():find(" where ", 1, true) then
+        sql = sql:gsub(" [Oo][Rr][Dd][Ee][Rr] [Bb][Yy] ", " and " .. where_sql .. " order by ", 1)
+      else
+        sql = sql:gsub(" [Oo][Rr][Dd][Ee][Rr] [Bb][Yy] ", " where " .. where_sql .. " order by ", 1)
+      end
+    end
+
+    if limit and limit > 0 then
+      if driver == "mssql" then
+        if offset and offset > 0 then
+          -- MSSQL: OFFSET/FETCH requires ORDER BY (already present in base SQL)
+          sql = sql .. string.format(" offset %d rows fetch next %d rows only", offset, limit)
+        else
+          sql = sql:gsub("^[Ss][Ee][Ll][Ee][Cc][Tt]%s+", "select top " .. tostring(limit) .. " ", 1)
+        end
+      else
+        sql = sql .. " limit " .. tostring(limit)
+        if offset and offset > 0 then
+          sql = sql .. " offset " .. tostring(offset)
+        end
+      end
+    end
+  end
 
   local rows, err = run_usql_json(dsn, sql)
   if not rows then
@@ -645,7 +689,7 @@ schema_list_items = function(dsn, category, schema_name, search_term, limit)
       })
     else
       table.insert(items, {
-        schema = table_schema,
+        schema = table_schema or "main",
         name = table_name,
         type = category.key == "tables" and "TABLE" or "VIEW",
       })
@@ -711,6 +755,24 @@ local function cached_schema_items(conn, category, schema_name, search_term, lim
 end
 
 local function fetch_columns_for_object(dsn, schema_name, object_name)
+  local driver = connection.detect_driver(dsn)
+
+  if driver == "sqlite" then
+    local rows, err = run_usql_json(dsn, string.format("PRAGMA table_info('%s')", escape_sql_string(object_name)))
+    if not rows then
+      return nil, err
+    end
+    local columns = {}
+    for _, row in ipairs(rows) do
+      table.insert(columns, {
+        ordinal_position = row_field(row, "cid", "CID"),
+        column_name = row_field(row, "name", "NAME"),
+        data_type = row_field(row, "type", "TYPE") or "TEXT",
+      })
+    end
+    return columns, nil
+  end
+
   local rows, err = run_usql_json(
     dsn,
     string.format(
@@ -785,8 +847,14 @@ end
 local function schema_preview_text(dsn, category, item)
   local schema = escape_sql_string(item.schema)
   local name = escape_sql_string(item.name)
+  local driver = connection.detect_driver(dsn)
 
   if category.key == "functions" or category.key == "procedures" then
+    -- SQLite has no functions/procedures
+    if driver == "sqlite" then
+      return "SQLite nao suporta funcoes ou procedures."
+    end
+
     local lines = {
       string.format("%s.%s", item.schema, item.name),
       string.format("Tipo: %s", item.type or (category.key == "functions" and "FUNCTION" or "PROCEDURE")),
@@ -818,14 +886,23 @@ local function schema_preview_text(dsn, category, item)
       table.insert(lines, "Parametros: nenhum parametro encontrado")
     end
 
-    local def, def_err = run_usql_json(
-      dsn,
-      string.format(
+    local driver = connection.detect_driver(dsn)
+    local def_sql
+    if driver == "mssql" then
+      def_sql = string.format(
         "select top 1 ROUTINE_DEFINITION from INFORMATION_SCHEMA.ROUTINES where ROUTINE_SCHEMA = '%s' and ROUTINE_NAME = '%s'",
         schema,
         name
       )
-    )
+    else
+      def_sql = string.format(
+        "select ROUTINE_DEFINITION from INFORMATION_SCHEMA.ROUTINES where ROUTINE_SCHEMA = '%s' and ROUTINE_NAME = '%s' limit 1",
+        schema,
+        name
+      )
+    end
+
+    local def, def_err = run_usql_json(dsn, def_sql)
 
     local definition = def and def[1] and row_field(def[1], "ROUTINE_DEFINITION", "routine_definition", "routineDefinition")
     if trim(definition) ~= "" then
@@ -862,13 +939,12 @@ local function schema_summary_preview(schema_item, conn)
   local lines = {
     string.format("Schema: %s", schema_item.name),
     "",
-    string.format("Tabelas: %s", schema_item.tables_count ~= nil and tostring(schema_item.tables_count) or "sob demanda"),
-    string.format("Views: %s", schema_item.views_count ~= nil and tostring(schema_item.views_count) or "sob demanda"),
-    string.format("Functions: %s", schema_item.functions_count ~= nil and tostring(schema_item.functions_count) or "sob demanda"),
-    string.format("Procedures: %s", schema_item.procedures_count ~= nil and tostring(schema_item.procedures_count) or "sob demanda"),
+    string.format("Tabelas: %d", schema_item.tables_count or 0),
+    string.format("Views: %d", schema_item.views_count or 0),
+    string.format("Functions: %d", schema_item.functions_count or 0),
+    string.format("Procedures: %d", schema_item.procedures_count or 0),
     "",
-    string.format("Limite rapido por categoria: %d objetos", schema_object_limit()),
-    "Schemas grandes usam filtro incremental por prefixo enquanto voce digita.",
+    string.format("Objetos por categoria: use Telescope para filtrar localmente."),
   }
 
   if conn and conn.persistent_cache and conn.persistent_cache.built_at then
@@ -896,34 +972,6 @@ local function apply_source_status(items, status)
     end
   end
   return items
-end
-
-local function merge_search_items(preferred, fallback)
-  local merged = {}
-  local seen = {}
-
-  local function append(items)
-    for _, item in ipairs(items or {}) do
-      if type(item) == "table" and not item.kind then
-        local key = string.format("%s::%s", tostring(item.schema or ""), tostring(item.name or ""))
-        if key ~= "::" and not seen[key] then
-          seen[key] = true
-          merged[#merged + 1] = item
-        end
-      end
-    end
-  end
-
-  append(preferred)
-  append(fallback)
-
-  table.sort(merged, function(a, b)
-    local left = string.format("%s.%s", tostring(a.schema or ""), tostring(a.name or ""))
-    local right = string.format("%s.%s", tostring(b.schema or ""), tostring(b.name or ""))
-    return left < right
-  end)
-
-  return merged
 end
 
 local function schema_browser_preview(conn, category, item)
@@ -985,112 +1033,6 @@ local function schema_category_by_key(key)
   return next_schema_category(key or "tables", 0)
 end
 
-local function schema_live_search_items(conn, schema_name, category, prompt)
-  local term = trim(prompt or "")
-  if term == "" then
-    return {
-      {
-        kind = "hint",
-        name = "Digite para filtrar por nome...",
-        schema = schema_name,
-        type = category.label,
-      },
-    }
-  end
-
-  local min_chars = schema_live_search_min_chars()
-  if #term < min_chars then
-    return {
-      {
-        kind = "hint",
-        name = string.format("Digite pelo menos %d caracteres...", min_chars),
-        schema = schema_name,
-        type = category.label,
-      },
-    }
-  end
-
-  local items, err
-  local cache_term_key = table.concat({ "live-search", trim(conn.alias), schema_name, category.key, term:lower() }, "::")
-  if conn.persistent_cache then
-    local cached_items, cache_complete = cached_schema_items(conn, category, schema_name, term, schema_object_limit() + 1)
-    if cache_complete then
-      items = apply_source_status(cached_items, "complete")
-    else
-      local cached_partial = apply_source_status(cached_items or {}, "partial")
-      if #cached_partial >= schema_object_limit() then
-        items = cached_partial
-      else
-        local live_items = session.schema_cache[cache_term_key] and vim.deepcopy(session.schema_cache[cache_term_key]) or nil
-        if not live_items then
-          live_items, err = schema_list_items(conn.dsn, category, schema_name, term, schema_object_limit() + 1)
-          if live_items then
-            session.schema_cache[cache_term_key] = vim.deepcopy(live_items)
-          end
-        end
-
-        if live_items then
-          apply_source_status(live_items, "live")
-          local alias = trim(conn.alias)
-          if alias ~= "" and alias ~= "temporaria" then
-            conn.persistent_cache = upsert_persistent_schema_objects(alias, schema_name, category.key, live_items, false)
-          end
-          items = merge_search_items(cached_partial, live_items)
-        end
-      end
-    end
-  else
-    items = session.schema_cache[cache_term_key] and vim.deepcopy(session.schema_cache[cache_term_key]) or nil
-    if not items then
-      items, err = schema_list_items(conn.dsn, category, schema_name, term, schema_object_limit() + 1)
-      if items then
-        session.schema_cache[cache_term_key] = vim.deepcopy(items)
-      end
-    end
-    if items then
-      apply_source_status(items, "live")
-    end
-  end
-
-  if not items then
-    return {
-      {
-        kind = "error",
-        name = err,
-        schema = schema_name,
-        type = category.label,
-      },
-    }
-  end
-
-  local has_more = #items > schema_object_limit()
-  while #items > schema_object_limit() do
-    table.remove(items)
-  end
-
-  if has_more then
-    table.insert(items, 1, {
-      kind = "hint",
-      name = string.format("Mostrando os primeiros %d resultados para '%s'", schema_object_limit(), term),
-      schema = schema_name,
-      type = category.label,
-    })
-  end
-
-  if vim.tbl_isempty(items) then
-    return {
-      {
-        kind = "hint",
-        name = string.format("Nenhum resultado para '%s'", term),
-        schema = schema_name,
-        type = category.label,
-      },
-    }
-  end
-
-  return items
-end
-
 local function resolve_schema_connection(conn, on_ready)
   local alias = trim(conn.alias)
   if alias == "" or alias == "temporaria" then
@@ -1139,12 +1081,23 @@ local function resolve_schema_connection(conn, on_ready)
   end)
 end
 
-local function native_browser(conn, schema_name, category_key)
+local function native_browser(conn, schema_name, category_key, page)
   local category = schema_category_by_key(category_key or "tables")
-  local items, err = schema_list_items(conn.dsn, category, schema_name, nil, schema_object_limit())
+  local page_size = schema_page_size()
+  local current_page = page or 1
+  local current_offset = (current_page - 1) * page_size
+  local fetch_limit = page_size + 1
+  local items, err = schema_list_items(conn.dsn, category, schema_name, nil, fetch_limit, current_offset)
   if not items then
     notify(err, vim.log.levels.ERROR)
     return
+  end
+
+  local has_more = #items > page_size
+  if has_more then
+    while #items > page_size do
+      table.remove(items)
+    end
   end
 
   local native_items = {
@@ -1157,6 +1110,12 @@ local function native_browser(conn, schema_name, category_key)
       category = switch_category.key,
     })
   end
+  if current_page > 1 then
+    table.insert(native_items, {
+      label = string.format("[< Página %d]", current_page - 1),
+      kind = "prev_page",
+    })
+  end
   for _, item in ipairs(items) do
     table.insert(native_items, {
       label = string.format("%s.%s", item.schema, item.name),
@@ -1164,9 +1123,15 @@ local function native_browser(conn, schema_name, category_key)
       item = item,
     })
   end
+  if has_more then
+    table.insert(native_items, {
+      label = string.format("[Página %d >]", current_page + 1),
+      kind = "next_page",
+    })
+  end
 
   picker.select(native_items, {
-    prompt = string.format("%s | %s", schema_name, category.label),
+    prompt = string.format("%s | %s (pág. %d)", schema_name, category.label, current_page),
     format_item = function(item)
       return item.label
     end,
@@ -1182,6 +1147,14 @@ local function native_browser(conn, schema_name, category_key)
       native_browser(conn, schema_name, choice.category)
       return
     end
+    if choice.kind == "prev_page" then
+      native_browser(conn, schema_name, category_key, current_page - 1)
+      return
+    end
+    if choice.kind == "next_page" then
+      native_browser(conn, schema_name, category_key, current_page + 1)
+      return
+    end
 
     if category.key == "tables" or category.key == "views" then
       data_viewer.open_for_item(conn, choice.item)
@@ -1192,59 +1165,57 @@ local function native_browser(conn, schema_name, category_key)
   end)
 end
 
-local function open_schema_browser(conn, schema_name, category_key, search_term)
+local BROWSER_PAGE_SIZE = 1000
+
+local function open_schema_browser(conn, schema_name, category_key, page)
   local has_telescope, pickers = pcall(require, "telescope.pickers")
   if not has_telescope then
-    native_browser(conn, schema_name, category_key)
+    native_browser(conn, schema_name, category_key, page)
     return
   end
 
   local category = schema_category_by_key(category_key or "tables")
   local schema_sql_name = trim(schema_name)
-  local category_count = schema_category_count(schema_sql_name, category.key)
-  local has_unknown_count = schema_category_has_unknown_count(schema_sql_name, category.key)
-  local is_large_schema = has_unknown_count or (category_count and category_count > schema_object_limit())
-  local effective_search = search_term == "*" and "" or search_term
+  local current_page = page or 1
+  local offset = (current_page - 1) * BROWSER_PAGE_SIZE
 
-  local items, err
-  if conn.persistent_cache then
-    local cache_complete
-    items, cache_complete = cached_schema_items(conn, category, schema_sql_name, effective_search, schema_object_limit() + 1)
-    if not cache_complete then
-      if is_large_schema then
-        items = schema_live_search_items(conn, schema_sql_name, category, effective_search)
-      else
-        items, err = schema_list_items(conn.dsn, category, schema_sql_name, effective_search, schema_object_limit() + 1)
-        if items then
-          local alias = trim(conn.alias)
-          if alias ~= "" and alias ~= "temporaria" then
-            conn.persistent_cache = upsert_persistent_schema_objects(alias, schema_sql_name, category.key, items, false)
-          end
-          apply_source_status(items, cache_complete and "complete" or "partial")
-        end
-      end
-    else
-      apply_source_status(items, "complete")
-    end
-  elseif is_large_schema then
-    items = schema_live_search_items(conn, schema_sql_name, category, effective_search)
-  else
-    items, err = schema_list_items(conn.dsn, category, schema_sql_name, effective_search, schema_object_limit() + 1)
-    if items then
-      apply_source_status(items, "live")
-    end
-  end
+  -- Fetch one extra to detect if there is a next page.
+  local items, err = schema_list_items(conn.dsn, category, schema_sql_name, "", BROWSER_PAGE_SIZE + 1, offset)
 
   if not items then
     notify(err, vim.log.levels.ERROR)
     return
   end
 
-  local has_more = not is_large_schema and #items > schema_object_limit()
-  if has_more then
-    while #items > schema_object_limit() do
+  local has_next = #items > BROWSER_PAGE_SIZE
+  if has_next then
+    while #items > BROWSER_PAGE_SIZE do
       table.remove(items)
     end
+  end
+
+  local alias = trim(conn.alias)
+  if alias ~= "" and alias ~= "temporaria" and conn.persistent_cache then
+    conn.persistent_cache = upsert_persistent_schema_objects(alias, schema_sql_name, category.key, items, false)
+  end
+  apply_source_status(items, "live")
+
+  -- Pagination hint rows (non-selectable).
+  if has_next then
+    table.insert(items, {
+      kind = "hint",
+      name = string.format("<C-g>  próxima página (%d)", current_page + 1),
+      schema = schema_sql_name,
+      type = category.label,
+    })
+  end
+  if current_page > 1 then
+    table.insert(items, 1, {
+      kind = "hint",
+      name = string.format("<C-e>  página anterior (%d)", current_page - 1),
+      schema = schema_sql_name,
+      type = category.label,
+    })
   end
 
   local finders = require("telescope.finders")
@@ -1289,7 +1260,9 @@ local function open_schema_browser(conn, schema_name, category_key, search_term)
 
   pickers
     .new(require("telescope.themes").get_dropdown({
-      prompt_title = string.format("%s | %s (%s)", schema_sql_name, category.label, conn.alias),
+      prompt_title = current_page > 1
+        and string.format("%s | %s (%s) [Pág. %d]", schema_sql_name, category.label, conn.alias, current_page)
+        or  string.format("%s | %s (%s)", schema_sql_name, category.label, conn.alias),
       layout_strategy = "horizontal",
       layout_config = {
         width = 0.9,
@@ -1310,47 +1283,32 @@ local function open_schema_browser(conn, schema_name, category_key, search_term)
         end,
       }),
       attach_mappings = function(prompt_bufnr)
-        local current_picker = action_state.get_current_picker(prompt_bufnr)
-        local refresh_seq = 0
-
-        local function refresh_live_items()
-          if not is_large_schema then
-            return
-          end
-          refresh_seq = refresh_seq + 1
-          local seq = refresh_seq
-          vim.defer_fn(function()
-            if seq ~= refresh_seq then
-              return
-            end
-            if not current_picker or not current_picker.prompt_bufnr or not vim.api.nvim_buf_is_valid(current_picker.prompt_bufnr) then
-              return
-            end
-            local prompt = action_state.get_current_line()
-            local live_items = schema_live_search_items(conn, schema_sql_name, category, prompt)
-            current_picker:refresh(finders.new_table({
-              results = live_items,
-              entry_maker = make_entry,
-            }), { reset_prompt = false })
-          end, schema_live_search_debounce_ms())
-        end
-
-        if is_large_schema then
-          vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged" }, {
-            buffer = prompt_bufnr,
-            callback = refresh_live_items,
-          })
-        end
-
         local function reopen(next_category_key)
           actions.close(prompt_bufnr)
           vim.schedule(function()
-            open_schema_browser(conn, schema_sql_name, next_category_key, nil)
+            open_schema_browser(conn, schema_sql_name, next_category_key, 1)
           end)
         end
 
         local function map(lhs, fn)
           vim.keymap.set({ "i", "n" }, lhs, fn, { buffer = prompt_bufnr, silent = true })
+        end
+
+        if has_next then
+          map("<C-g>", function()
+            actions.close(prompt_bufnr)
+            vim.schedule(function()
+              open_schema_browser(conn, schema_sql_name, category.key, current_page + 1)
+            end)
+          end)
+        end
+        if current_page > 1 then
+          map("<C-e>", function()
+            actions.close(prompt_bufnr)
+            vim.schedule(function()
+              open_schema_browser(conn, schema_sql_name, category.key, current_page - 1)
+            end)
+          end)
         end
 
         actions.select_default:replace(function()
@@ -1439,14 +1397,7 @@ local function open_schema_picker(conn)
     picker.select(schemas, {
       prompt = "SQL Schemas",
       format_item = function(item)
-        return string.format(
-          "%s  T:%s V:%s F:%s P:%s",
-          item.name,
-          item.tables_count ~= nil and tostring(item.tables_count) or "?",
-          item.views_count ~= nil and tostring(item.views_count) or "?",
-          item.functions_count ~= nil and tostring(item.functions_count) or "?",
-          item.procedures_count ~= nil and tostring(item.procedures_count) or "?"
-        )
+        return string.format("%s  T:%d V:%d F:%d P:%d", item.name, item.tables_count or 0, item.views_count or 0, item.functions_count or 0, item.procedures_count or 0)
       end,
     }, function(choice)
       if choice then
@@ -1482,12 +1433,12 @@ local function open_schema_picker(conn)
         results = schemas,
         entry_maker = function(item)
           local display = string.format(
-            "%s  T:%s V:%s F:%s P:%s",
+            "%s  T:%d V:%d F:%d P:%d",
             item.name,
-            item.tables_count ~= nil and tostring(item.tables_count) or "?",
-            item.views_count ~= nil and tostring(item.views_count) or "?",
-            item.functions_count ~= nil and tostring(item.functions_count) or "?",
-            item.procedures_count ~= nil and tostring(item.procedures_count) or "?"
+            item.tables_count or 0,
+            item.views_count or 0,
+            item.functions_count or 0,
+            item.procedures_count or 0
           )
           return {
             value = item.name,
@@ -1546,7 +1497,22 @@ function M._build_cache_for_connection(conn)
 
   for index, schema_item in ipairs(schemas) do
     local schema_name = schema_item.name
-    local bundle = load_persistent_bundle(alias, schema_name) or empty_schema_bundle(schema_name)
+    local bundle = load_persistent_bundle(alias, schema_name) or {
+      schema = schema_name,
+      objects = {
+        tables = {},
+        views = {},
+        functions = {},
+        procedures = {},
+      },
+      columns = {},
+      complete = {
+        tables = false,
+        views = false,
+        functions = false,
+        procedures = false,
+      },
+    }
 
     update_loading_panel(conn._loading_panel, {
       "sqlui schema cache",
@@ -1567,7 +1533,7 @@ function M._build_cache_for_connection(conn)
       end
 
       if category and not (bundle.complete and bundle.complete[category.key] == true) then
-        local items, category_err = fetch_schema_category_in_batches(conn.dsn, category, schema_name)
+        local items, category_err = schema_list_items(conn.dsn, category, schema_name, nil, nil)
         if not items then
           return nil, category_err
         end
@@ -1587,7 +1553,7 @@ function M._build_cache_for_connection(conn)
       "Fechando automaticamente ao concluir.",
     })
 
-    if should_preload_columns() and next(bundle.columns or {}) == nil then
+    if next(bundle.columns or {}) == nil then
       local columns, columns_err = build_columns_cache_for_schema(conn.dsn, schema_name)
       if columns then
         bundle.columns = columns
@@ -1764,10 +1730,6 @@ function M.get_completion_items(prefix)
     return a.label < b.label
   end)
   return items
-end
-
-function M._test_live_search_items(conn, schema_name, category_key, prompt)
-  return schema_live_search_items(conn, schema_name, schema_category_by_key(category_key), prompt)
 end
 
 return M

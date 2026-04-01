@@ -37,10 +37,14 @@ end
 
 --- Detect database driver from DSN scheme.
 --- @param dsn string
---- @return string driver one of "mssql", "postgres", "mysql", or "unknown"
+--- @return string driver one of "mssql", "postgres", "mysql", "sqlite", or "unknown"
 local function detect_driver(dsn)
   local scheme = (dsn or ""):match("^([%w]+)://")
   if not scheme then
+    -- sqlite3:/path/to/db also valid (single slash)
+    if (dsn or ""):match("^sqlite") then
+      return "sqlite"
+    end
     return "unknown"
   end
   scheme = scheme:lower()
@@ -52,6 +56,9 @@ local function detect_driver(dsn)
   end
   if scheme == "mysql" or scheme == "mariadb" then
     return "mysql"
+  end
+  if scheme == "sqlite3" or scheme == "sqlite" or scheme == "file" then
+    return "sqlite"
   end
   return "unknown"
 end
@@ -99,6 +106,14 @@ from information_schema.tables
 where table_schema not in ('information_schema','mysql','performance_schema','sys')
 group by table_schema
 order by table_schema
+]],
+  sqlite = [[
+select
+  'main' as schema_name,
+  (select count(*) from sqlite_master where type = 'table' and name not like 'sqlite_%') as tables_count,
+  (select count(*) from sqlite_master where type = 'view') as views_count,
+  0 as functions_count,
+  0 as procedures_count
 ]],
 }
 
@@ -172,7 +187,18 @@ end
 --- After a connection is selected, prompt schema selection.
 --- If only 1 relevant schema exists, auto-select it.
 --- If no relevant schemas or usql fails, skip silently (set schema = nil).
+--- For SQLite, always auto-select "main" (single implicit schema).
 local function prompt_schema_selection(conn, on_done)
+  if detect_driver(conn.dsn) == "sqlite" then
+    conn.schema = "main"
+    set_active_connection(conn)
+    notify("sqlui conectado em '" .. conn.alias .. "/main'")
+    if on_done then
+      on_done(conn)
+    end
+    return
+  end
+
   local schemas, err = fetch_schemas(conn.dsn)
   if not schemas then
     notify("schemas nao carregados: " .. (err or "erro desconhecido"), vim.log.levels.WARN)
@@ -407,6 +433,175 @@ local function prompt_new_connection(on_confirm)
   end)
 end
 
+--- Validate and canonicalize a local file path for SQLite DSN.
+--- Rejects non-existent files and returns only canonical absolute paths.
+--- @param raw_path string
+--- @return string|nil canonical_path
+--- @return string|nil error
+local function validate_sqlite_path(raw_path)
+  if not raw_path or trim(raw_path) == "" then
+    return nil, "caminho vazio"
+  end
+  local expanded = vim.fn.expand(raw_path)
+  local canonical = vim.fn.resolve(expanded)
+  if vim.fn.filereadable(canonical) ~= 1 then
+    return nil, "arquivo nao encontrado"
+  end
+  return canonical, nil
+end
+
+--- Build a safe SQLite DSN from a canonical absolute path.
+--- @param canonical_path string Must be an absolute, canonicalized path
+--- @return string dsn
+local function build_sqlite_dsn(canonical_path)
+  return "sqlite3://" .. canonical_path
+end
+
+--- Save a validated SQLite connection and proceed to schema selection.
+local function save_sqlite_and_connect(filepath, on_confirm)
+  local canonical, path_err = validate_sqlite_path(filepath)
+  if not canonical then
+    notify(path_err, vim.log.levels.ERROR)
+    return
+  end
+  picker.input({ prompt = "Apelido da conexao: ", default = vim.fn.fnamemodify(canonical, ":t:r") }, function(alias)
+    alias = trim(alias)
+    if alias == "" then
+      return
+    end
+    local dsn = build_sqlite_dsn(canonical)
+    local ok, err = M.save(alias, dsn)
+    if not ok then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+    local conn = { alias = alias, dsn = dsn }
+    prompt_schema_selection(conn, on_confirm)
+  end)
+end
+
+local function prompt_sqlite_connection(on_confirm)
+  local has_telescope, tel_pickers = pcall(require, "telescope.pickers")
+  if has_telescope then
+    local finders = require("telescope.finders")
+    local conf = require("telescope.config").values
+    local actions = require("telescope.actions")
+    local action_state = require("telescope.actions.state")
+    local has_async, async_scan = pcall(require, "plenary.async")
+    local scan = require("plenary.scandir")
+
+    -- Workspace-scoped only: scan cwd with capped depth, off main thread
+    local cwd = vim.fn.getcwd()
+    notify("buscando arquivos .db em " .. vim.fn.fnamemodify(cwd, ":~") .. "...")
+
+    local function show_picker_or_fallback(db_files)
+      -- Deduplicate via canonical paths
+      local seen = {}
+      local unique = {}
+      for _, f in ipairs(db_files) do
+        local canonical = vim.fn.resolve(f)
+        if not seen[canonical] then
+          seen[canonical] = true
+          table.insert(unique, canonical)
+        end
+      end
+
+      if #unique == 0 then
+        picker.input({ prompt = "Caminho do arquivo .db: " }, function(path)
+          path = trim(path)
+          if path == "" then
+            return
+          end
+          save_sqlite_and_connect(path, on_confirm)
+        end)
+        return
+      end
+
+      tel_pickers
+        .new(require("telescope.themes").get_dropdown({
+          prompt_title = "Selecionar arquivo SQLite (.db)",
+          layout_config = { width = 0.7, height = 0.5 },
+        }), {
+          finder = finders.new_table({
+            results = unique,
+            entry_maker = function(filepath)
+              local rel = vim.fn.fnamemodify(filepath, ":~:.")
+              return {
+                value = filepath,
+                display = rel,
+                ordinal = filepath,
+              }
+            end,
+          }),
+          sorter = conf.generic_sorter({}),
+          attach_mappings = function(prompt_bufnr)
+            actions.select_default:replace(function()
+              local entry = action_state.get_selected_entry()
+              actions.close(prompt_bufnr)
+              if not entry then
+                return
+              end
+              vim.schedule(function()
+                save_sqlite_and_connect(entry.value, on_confirm)
+              end)
+            end)
+            return true
+          end,
+        })
+        :find()
+    end
+
+    -- Run scan in a separate coroutine via plenary.async if available,
+    -- otherwise fallback to vim.schedule (deferred but still main thread)
+    if has_async and async_scan then
+      local ok_wrap = pcall(function()
+        async_scan.run(function()
+          local db_files = scan.scan_dir(cwd, {
+            search_pattern = "%.db$",
+            hidden = false,
+            depth = 5,
+            silent = true,
+          }) or {}
+          vim.schedule(function()
+            show_picker_or_fallback(db_files)
+          end)
+        end)
+      end)
+      if not ok_wrap then
+        -- plenary.async not usable, fallback
+        vim.schedule(function()
+          local db_files = scan.scan_dir(cwd, {
+            search_pattern = "%.db$",
+            hidden = false,
+            depth = 5,
+            silent = true,
+          }) or {}
+          show_picker_or_fallback(db_files)
+        end)
+      end
+    else
+      vim.schedule(function()
+        local db_files = scan.scan_dir(cwd, {
+          search_pattern = "%.db$",
+          hidden = false,
+          depth = 5,
+          silent = true,
+        }) or {}
+        show_picker_or_fallback(db_files)
+      end)
+    end
+  else
+    -- Native fallback: prompt for file path
+    picker.input({ prompt = "Caminho do arquivo .db: " }, function(path)
+      path = trim(path)
+      if path == "" then
+        return
+      end
+      save_sqlite_and_connect(path, on_confirm)
+    end)
+  end
+end
+
 local function prompt_temporary_connection(on_confirm)
   picker.input({ prompt = "DSN/URL temporaria: " }, function(dsn)
     local conn = { alias = "temporaria", dsn = trim(dsn) }
@@ -500,6 +695,7 @@ function M.select(on_confirm)
     table.insert(items, { label = alias, kind = "saved", alias = alias })
   end
   table.insert(items, { label = "+ Nova conexao salva", kind = "new" })
+  table.insert(items, { label = "+ Conexao SQLite", kind = "sqlite" })
   table.insert(items, { label = "+ Editar conexao salva", kind = "edit" })
   table.insert(items, { label = "+ Renomear conexao salva", kind = "rename" })
   table.insert(items, { label = "+ Duplicar conexao salva", kind = "duplicate" })
@@ -532,6 +728,10 @@ function M.select(on_confirm)
 
     if choice.kind == "new" then
       prompt_new_connection(on_confirm)
+      return
+    end
+    if choice.kind == "sqlite" then
+      prompt_sqlite_connection(on_confirm)
       return
     end
     if choice.kind == "edit" then

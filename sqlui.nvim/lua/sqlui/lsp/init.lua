@@ -10,7 +10,11 @@ local runtime = {
 }
 
 local function notify(msg, level)
-  vim.notify(msg, level or vim.log.levels.INFO, { title = "sqlui" })
+  local safe_msg = tostring(msg or "sqlui: erro desconhecido")
+  local ok = pcall(vim.notify, safe_msg, level or vim.log.levels.INFO, { title = "sqlui" })
+  if not ok then
+    vim.notify(safe_msg, level or vim.log.levels.INFO)
+  end
 end
 
 local function sqls_driver_from_dsn(dsn)
@@ -114,6 +118,7 @@ end
 --- Build sqls connectionConfig from the active DSN.
 --- For mssql/sqlserver: normalize URL for the patched sqls (sqlserver:// scheme,
 --- path moved to ?database= param), pass as dataSourceName.
+--- For sqlite3: extract file path from DSN for sqls.
 --- For other drivers: pass dataSourceName directly.
 local function build_connection_config(dsn)
   local driver = sqls_driver_from_dsn(dsn)
@@ -123,6 +128,30 @@ local function build_connection_config(dsn)
     return {
       driver = driver,
       dataSourceName = normalized,
+    }
+  end
+
+  if driver == "sqlite3" then
+    -- sqls expects just the file path for sqlite3 driver
+    -- Hard-reject file://host/ forms (authority component) — only local paths allowed
+    if dsn:match("^file://[^/]") then
+      notify("sqlui: file:// com authority nao suportado para SQLite", vim.log.levels.ERROR)
+      return nil
+    end
+    local path = dsn:match("^sqlite3?://(.+)$") or dsn:match("^file:///(.+)$")
+    if not path then
+      -- Might be sqlite3:/path (single slash)
+      path = dsn:match("^sqlite3?:(.+)$")
+    end
+    if not path or trim(path) == "" then
+      notify("sqlui: caminho SQLite invalido no DSN", vim.log.levels.ERROR)
+      return nil
+    end
+    -- Canonicalize the path
+    path = vim.fn.resolve(vim.fn.expand(path))
+    return {
+      driver = driver,
+      dataSourceName = path,
     }
   end
 
