@@ -640,7 +640,13 @@ local function schema_list_items(dsn, category, schema_name, search_term, limit,
 
     if trim(schema_name) ~= "" then
       if category.key == "functions" or category.key == "procedures" then
-        table.insert(clauses, string.format("ROUTINE_SCHEMA = '%s'", escape_sql_string(schema_name)))
+        if driver == "mssql" then
+          table.insert(clauses, string.format("SCHEMA_NAME(schema_id) = '%s'", escape_sql_string(schema_name)))
+        elseif driver == "postgres" then
+          table.insert(clauses, string.format("n.nspname = '%s'", escape_sql_string(schema_name)))
+        else
+          table.insert(clauses, string.format("ROUTINE_SCHEMA = '%s'", escape_sql_string(schema_name)))
+        end
       else
         table.insert(clauses, string.format("TABLE_SCHEMA = '%s'", escape_sql_string(schema_name)))
       end
@@ -649,7 +655,13 @@ local function schema_list_items(dsn, category, schema_name, search_term, limit,
     if trim(search_term) ~= "" then
       local pattern = escape_sql_string(search_term) .. "%%%"
       if category.key == "functions" or category.key == "procedures" then
-        table.insert(clauses, string.format("ROUTINE_NAME like '%s'", pattern))
+        if driver == "mssql" then
+          table.insert(clauses, string.format("name like '%s'", pattern))
+        elseif driver == "postgres" then
+          table.insert(clauses, string.format("p.proname like '%s'", pattern))
+        else
+          table.insert(clauses, string.format("ROUTINE_NAME like '%s'", pattern))
+        end
       else
         table.insert(clauses, string.format("TABLE_NAME like '%s'", pattern))
       end
