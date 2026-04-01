@@ -679,6 +679,10 @@ local function open_viewer(ctx)
   ctx.tab = tab
   viewers[data_buf] = ctx
 
+  -- Name the tab after the table being viewed (schema.table)
+  local buf_name = string.format("sqlui://%s.%s", ctx.schema_name or "", ctx.object_name or "")
+  pcall(vim.api.nvim_buf_set_name, data_buf, buf_name)
+
   -- Focus the data window
   vim.api.nvim_set_current_win(data_win)
 
