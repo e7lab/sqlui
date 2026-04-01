@@ -62,10 +62,6 @@ local function cache_config()
   return config.cache or {}
 end
 
-local function schema_object_limit()
-  return cache_config().schema_object_limit or 30
-end
-
 local function schema_page_size()
   return cache_config().schema_page_size or 15
 end
@@ -948,8 +944,7 @@ local function schema_summary_preview(schema_item, conn)
     string.format("Functions: %d", schema_item.functions_count or 0),
     string.format("Procedures: %d", schema_item.procedures_count or 0),
     "",
-    string.format("Limite rapido por categoria: %d objetos", schema_object_limit()),
-    "Schemas grandes usam filtro incremental por prefixo enquanto voce digita.",
+    string.format("Objetos por categoria: use Telescope para filtrar localmente."),
   }
 
   if conn and conn.persistent_cache and conn.persistent_cache.built_at then
@@ -1036,88 +1031,6 @@ end
 
 local function schema_category_by_key(key)
   return next_schema_category(key or "tables", 0)
-end
-
-local function schema_live_search_items(conn, schema_name, category, prompt)
-  local term = trim(prompt or "")
-  if term == "" then
-    return {
-      {
-        kind = "hint",
-        name = "Digite para filtrar por nome...",
-        schema = schema_name,
-        type = category.label,
-      },
-    }
-  end
-
-  if #term < 2 then
-    return {
-      {
-        kind = "hint",
-        name = "Digite pelo menos 2 caracteres...",
-        schema = schema_name,
-        type = category.label,
-      },
-    }
-  end
-
-  local items, err
-  if conn.persistent_cache then
-    local cache_complete
-    items, cache_complete = cached_schema_items(conn, category, schema_name, term, schema_object_limit() + 1)
-    if not cache_complete then
-      items, err = schema_list_items(conn.dsn, category, schema_name, term, schema_object_limit() + 1)
-      if items then
-        local alias = trim(conn.alias)
-          if alias ~= "" and alias ~= "temporaria" then
-            conn.persistent_cache = upsert_persistent_schema_objects(alias, schema_name, category.key, items, false)
-          end
-        end
-      end
-  else
-    items, err = schema_list_items(conn.dsn, category, schema_name, term, schema_object_limit() + 1)
-  end
-
-  if not items then
-    return {
-      {
-        kind = "error",
-        name = err,
-        schema = schema_name,
-        type = category.label,
-      },
-    }
-  end
-
-  local has_more = #items > schema_object_limit()
-  while #items > schema_object_limit() do
-    table.remove(items)
-  end
-
-  apply_source_status(items, "live")
-
-  if has_more then
-    table.insert(items, 1, {
-      kind = "hint",
-      name = string.format("Mostrando os primeiros %d resultados para '%s'", schema_object_limit(), term),
-      schema = schema_name,
-      type = category.label,
-    })
-  end
-
-  if vim.tbl_isempty(items) then
-    return {
-      {
-        kind = "hint",
-        name = string.format("Nenhum resultado para '%s'", term),
-        schema = schema_name,
-        type = category.label,
-      },
-    }
-  end
-
-  return items
 end
 
 local function resolve_schema_connection(conn, on_ready)
@@ -1252,7 +1165,9 @@ local function native_browser(conn, schema_name, category_key, page)
   end)
 end
 
-local function open_schema_browser(conn, schema_name, category_key, search_term, page)
+local BROWSER_PAGE_SIZE = 1000
+
+local function open_schema_browser(conn, schema_name, category_key, page)
   local has_telescope, pickers = pcall(require, "telescope.pickers")
   if not has_telescope then
     native_browser(conn, schema_name, category_key, page)
@@ -1261,80 +1176,43 @@ local function open_schema_browser(conn, schema_name, category_key, search_term,
 
   local category = schema_category_by_key(category_key or "tables")
   local schema_sql_name = trim(schema_name)
-  local category_count = schema_category_count(schema_sql_name, category.key)
-  local page_size = schema_page_size()
   local current_page = page or 1
-  local current_offset = (current_page - 1) * page_size
-  local fetch_limit = page_size + 1
-  local is_large_schema = category_count and category_count > schema_object_limit()
-  local effective_search = search_term == "*" and "" or search_term
+  local offset = (current_page - 1) * BROWSER_PAGE_SIZE
 
-  local items, err
-  if conn.persistent_cache then
-    local cache_complete
-    items, cache_complete = cached_schema_items(conn, category, schema_sql_name, effective_search, fetch_limit)
-    if not cache_complete then
-      if is_large_schema and current_page == 1 then
-        items = schema_live_search_items(conn, schema_sql_name, category, effective_search)
-      else
-        items, err = schema_list_items(conn.dsn, category, schema_sql_name, effective_search, fetch_limit, current_offset)
-        if items then
-          local alias = trim(conn.alias)
-          if alias ~= "" and alias ~= "temporaria" then
-            conn.persistent_cache = upsert_persistent_schema_objects(alias, schema_sql_name, category.key, items, false)
-          end
-          apply_source_status(items, cache_complete and "complete" or "partial")
-        end
-      end
-    else
-      apply_source_status(items, "complete")
-    end
-  elseif is_large_schema and current_page == 1 then
-    items = schema_live_search_items(conn, schema_sql_name, category, effective_search)
-  else
-    items, err = schema_list_items(conn.dsn, category, schema_sql_name, effective_search, fetch_limit, current_offset)
-    if items then
-      apply_source_status(items, "live")
-    end
-  end
+  -- Fetch one extra to detect if there is a next page.
+  local items, err = schema_list_items(conn.dsn, category, schema_sql_name, "", BROWSER_PAGE_SIZE + 1, offset)
 
   if not items then
     notify(err, vim.log.levels.ERROR)
     return
   end
 
-  local has_more = not is_large_schema and #items > page_size
-  if has_more then
-    while #items > page_size do
+  local has_next = #items > BROWSER_PAGE_SIZE
+  if has_next then
+    while #items > BROWSER_PAGE_SIZE do
       table.remove(items)
     end
   end
 
-  -- total pages estimate
-  local total_pages
-  if category_count and category_count > 0 then
-    total_pages = math.ceil(category_count / page_size)
+  local alias = trim(conn.alias)
+  if alias ~= "" and alias ~= "temporaria" and conn.persistent_cache then
+    conn.persistent_cache = upsert_persistent_schema_objects(alias, schema_sql_name, category.key, items, false)
   end
+  apply_source_status(items, "live")
 
-  -- page indicator hint at top
-  local page_label
-  if total_pages then
-    page_label = string.format("Página %d/%d", current_page, total_pages)
-  else
-    page_label = string.format("Página %d", current_page)
+  -- Pagination hint rows (non-selectable).
+  if has_next then
+    table.insert(items, {
+      kind = "hint",
+      name = string.format("<C-f>  próxima página (%d)", current_page + 1),
+      schema = schema_sql_name,
+      type = category.label,
+    })
   end
-
-  if current_page > 1 or has_more then
-    local nav_parts = {}
-    if current_page > 1 then
-      table.insert(nav_parts, "[p anterior")
-    end
-    if has_more then
-      table.insert(nav_parts, "]p próxima")
-    end
+  if current_page > 1 then
     table.insert(items, 1, {
       kind = "hint",
-      name = string.format("%s  (%s)", page_label, table.concat(nav_parts, " | ")),
+      name = string.format("<C-b>  página anterior (%d)", current_page - 1),
       schema = schema_sql_name,
       type = category.label,
     })
@@ -1382,7 +1260,9 @@ local function open_schema_browser(conn, schema_name, category_key, search_term,
 
   pickers
     .new(require("telescope.themes").get_dropdown({
-      prompt_title = string.format("%s | %s (%s) %s", schema_sql_name, category.label, conn.alias, page_label),
+      prompt_title = current_page > 1
+        and string.format("%s | %s (%s) [Pág. %d]", schema_sql_name, category.label, conn.alias, current_page)
+        or  string.format("%s | %s (%s)", schema_sql_name, category.label, conn.alias),
       layout_strategy = "horizontal",
       layout_config = {
         width = 0.9,
@@ -1403,47 +1283,32 @@ local function open_schema_browser(conn, schema_name, category_key, search_term,
         end,
       }),
       attach_mappings = function(prompt_bufnr)
-        local current_picker = action_state.get_current_picker(prompt_bufnr)
-        local refresh_seq = 0
-
-        local function refresh_live_items()
-          if not is_large_schema then
-            return
-          end
-          refresh_seq = refresh_seq + 1
-          local seq = refresh_seq
-          vim.defer_fn(function()
-            if seq ~= refresh_seq then
-              return
-            end
-            if not current_picker or not current_picker.prompt_bufnr or not vim.api.nvim_buf_is_valid(current_picker.prompt_bufnr) then
-              return
-            end
-            local prompt = action_state.get_current_line()
-            local live_items = schema_live_search_items(conn, schema_sql_name, category, prompt)
-            current_picker:refresh(finders.new_table({
-              results = live_items,
-              entry_maker = make_entry,
-            }), { reset_prompt = false })
-          end, schema_live_search_debounce_ms())
-        end
-
-        if is_large_schema then
-          vim.api.nvim_create_autocmd({ "TextChangedI", "TextChanged" }, {
-            buffer = prompt_bufnr,
-            callback = refresh_live_items,
-          })
-        end
-
         local function reopen(next_category_key)
           actions.close(prompt_bufnr)
           vim.schedule(function()
-            open_schema_browser(conn, schema_sql_name, next_category_key, nil)
+            open_schema_browser(conn, schema_sql_name, next_category_key, 1)
           end)
         end
 
         local function map(lhs, fn)
           vim.keymap.set({ "i", "n" }, lhs, fn, { buffer = prompt_bufnr, silent = true })
+        end
+
+        if has_next then
+          map("<C-f>", function()
+            actions.close(prompt_bufnr)
+            vim.schedule(function()
+              open_schema_browser(conn, schema_sql_name, category.key, current_page + 1)
+            end)
+          end)
+        end
+        if current_page > 1 then
+          map("<C-b>", function()
+            actions.close(prompt_bufnr)
+            vim.schedule(function()
+              open_schema_browser(conn, schema_sql_name, category.key, current_page - 1)
+            end)
+          end)
         end
 
         actions.select_default:replace(function()
@@ -1507,24 +1372,6 @@ local function open_schema_browser(conn, schema_name, category_key, search_term,
         end)
         map("<Space>b", function()
           reopen(next_schema_category(category.key, -1).key)
-        end)
-        map("]p", function()
-          if not has_more then
-            return
-          end
-          actions.close(prompt_bufnr)
-          vim.schedule(function()
-            open_schema_browser(conn, schema_sql_name, category.key, effective_search, current_page + 1)
-          end)
-        end)
-        map("[p", function()
-          if current_page <= 1 then
-            return
-          end
-          actions.close(prompt_bufnr)
-          vim.schedule(function()
-            open_schema_browser(conn, schema_sql_name, category.key, effective_search, current_page - 1)
-          end)
         end)
         map("<Space>s", function()
           actions.close(prompt_bufnr)
