@@ -846,6 +846,45 @@ local function columns_preview_text(item, category, columns)
   return table.concat(lines, "\n")
 end
 
+local function open_view_sql(conn, item)
+  local driver = connection.detect_driver(conn.dsn)
+  local schema = escape_sql_string(item.schema)
+  local name   = escape_sql_string(item.name)
+
+  local def_sql
+  if driver == "mssql" then
+    def_sql = string.format(
+      "select top 1 VIEW_DEFINITION from INFORMATION_SCHEMA.VIEWS where TABLE_SCHEMA = '%s' and TABLE_NAME = '%s'",
+      schema, name
+    )
+  else
+    def_sql = string.format(
+      "select VIEW_DEFINITION from INFORMATION_SCHEMA.VIEWS where TABLE_SCHEMA = '%s' and TABLE_NAME = '%s' limit 1",
+      schema, name
+    )
+  end
+
+  local rows, err = run_usql_json(conn.dsn, def_sql)
+  local definition = rows and rows[1] and row_field(rows[1], "VIEW_DEFINITION", "view_definition", "viewDefinition")
+
+  if not definition or trim(definition) == "" then
+    notify(err or "Definicao da view nao disponivel para " .. item.name, vim.log.levels.WARN)
+    return
+  end
+
+  vim.cmd("tabnew")
+  local buf = vim.api.nvim_get_current_buf()
+  local buf_name = string.format("sqlui://%s.%s.view.sql", item.schema, item.name)
+  pcall(vim.api.nvim_buf_set_name, buf, buf_name)
+  vim.bo[buf].filetype    = "sql"
+  vim.bo[buf].buftype     = "nofile"
+  vim.bo[buf].bufhidden   = "wipe"
+  vim.bo[buf].swapfile    = false
+  vim.bo[buf].modifiable  = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(definition, "\n", { plain = true }))
+  vim.bo[buf].modifiable  = false
+end
+
 local function cached_columns_preview(conn, category, item)
   local alias = trim(conn.alias)
   if alias == "" or alias == "temporaria" then
@@ -1378,9 +1417,27 @@ local function open_schema_browser(conn, schema_name, category_key, page)
           if not entry or not entry.item or entry.item.kind == "hint" or entry.item.kind == "error" then
             return
           end
-          if category.key == "tables" or category.key == "views" then
+          if category.key == "tables" then
             vim.schedule(function()
               data_viewer.open_for_item(conn, entry.item)
+            end)
+            return
+          end
+          if category.key == "views" then
+            local item = entry.item
+            vim.schedule(function()
+              vim.ui.select(
+                { "Visualizar dados", "Editar SQL" },
+                { prompt = string.format("%s.%s →", item.schema, item.name) },
+                function(choice)
+                  if not choice then return end
+                  if choice == "Visualizar dados" then
+                    data_viewer.open_for_item(conn, item)
+                  else
+                    open_view_sql(conn, item)
+                  end
+                end
+              )
             end)
             return
           end
@@ -1391,6 +1448,20 @@ local function open_schema_browser(conn, schema_name, category_key, page)
             return
           end
           insert_schema_object(entry.item, category)
+        end)
+
+        map("<C-s>", function()
+          local entry = action_state.get_selected_entry()
+          if not entry or not entry.item or entry.item.kind == "hint" or entry.item.kind == "error" then
+            return
+          end
+          if category.key ~= "views" then
+            return
+          end
+          actions.close(prompt_bufnr)
+          vim.schedule(function()
+            open_view_sql(conn, entry.item)
+          end)
         end)
 
         map("<C-y>", function()
