@@ -326,7 +326,7 @@ function M.load(alias)
   if not secret or trim(secret) == "" then
     return nil
   end
-  local meta = state.get_connection_meta(alias)
+  local meta = state.get_connection_meta(alias) or {}
   return {
     alias = alias,
     dsn = secret,
