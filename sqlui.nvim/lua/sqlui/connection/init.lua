@@ -326,10 +326,33 @@ function M.load(alias)
   if not secret or trim(secret) == "" then
     return nil
   end
+  local meta = state.get_connection_meta(alias)
   return {
     alias = alias,
     dsn = secret,
+    runner = meta.runner or nil,
   }
+end
+
+--- Persist the runner choice for a named connection.
+--- @param alias string
+--- @param runner string|nil  "usql" | "sqlcmd" | nil (clears override)
+function M.set_runner(alias, runner)
+  if runner and runner ~= "" then
+    state.set_connection_meta(alias, { runner = runner })
+  else
+    local meta = state.get_connection_meta(alias)
+    meta.runner = nil
+    state.set_connection_meta(alias, meta)
+  end
+end
+
+--- Return the effective runner for a connection ("usql" when unset).
+--- @param alias string
+--- @return string
+function M.get_runner(alias)
+  local meta = state.get_connection_meta(alias)
+  return meta.runner or "usql"
 end
 
 function M.save(alias, dsn)
@@ -401,11 +424,54 @@ function M.select_existing(on_confirm)
       return
     end
 
-    prompt_schema_selection(conn, function(resolved)
-      if on_confirm then
-        on_confirm(resolved)
-      end
-    end)
+    -- Para MSSQL, sempre oferece a opcao de escolher/confirmar o runner
+    -- mesmo que ja tenha sido salvo (permite mudanca inline)
+    if detect_driver(conn.dsn) == "mssql" then
+      prompt_runner_for_mssql(conn.alias, conn.dsn, function(runner)
+        if runner then
+          M.set_runner(conn.alias, runner)
+          conn.runner = runner
+        end
+        prompt_schema_selection(conn, function(resolved)
+          if on_confirm then
+            on_confirm(resolved)
+          end
+        end)
+      end)
+    else
+      prompt_schema_selection(conn, function(resolved)
+        if on_confirm then
+          on_confirm(resolved)
+        end
+      end)
+    end
+  end)
+end
+
+--- Ask the user which runner to use for a MSSQL connection.
+--- For non-MSSQL drivers, skip and call on_done with runner=nil.
+--- @param alias string
+--- @param dsn string
+--- @param on_done fun(runner: string|nil)
+local function prompt_runner_for_mssql(alias, dsn, on_done)
+  if detect_driver(dsn) ~= "mssql" then
+    on_done(nil)
+    return
+  end
+
+  local current = M.get_runner(alias)
+  local items = {
+    { label = "usql  (padrao — sem suporte nativo a GO)",   value = "usql" },
+    { label = "sqlcmd (recomendado para BEGIN TRAN/COMMIT)", value = "sqlcmd" },
+  }
+
+  picker.select(items, {
+    prompt = string.format("Runner para conexao MSSQL '%s' (atual: %s)", alias, current),
+    format_item = function(item)
+      return item.label
+    end,
+  }, function(choice)
+    on_done(choice and choice.value or nil)
   end)
 end
 
@@ -423,11 +489,16 @@ local function prompt_new_connection(on_confirm)
         return
       end
 
-      local conn = { alias = clean_alias, dsn = trim(dsn) }
-      prompt_schema_selection(conn, function(resolved)
-        if on_confirm then
-          on_confirm(resolved)
+      prompt_runner_for_mssql(clean_alias, trim(dsn), function(runner)
+        if runner then
+          M.set_runner(clean_alias, runner)
         end
+        local conn = { alias = clean_alias, dsn = trim(dsn), runner = runner }
+        prompt_schema_selection(conn, function(resolved)
+          if on_confirm then
+            on_confirm(resolved)
+          end
+        end)
       end)
     end)
   end)
@@ -624,9 +695,14 @@ local function prompt_edit_connection()
         notify(err, vim.log.levels.ERROR)
         return
       end
-      local updated = { alias = conn.alias, dsn = trim(dsn) }
-      prompt_schema_selection(updated, function()
-        notify("conexao '" .. conn.alias .. "' atualizada")
+      prompt_runner_for_mssql(conn.alias, trim(dsn), function(runner)
+        if runner then
+          M.set_runner(conn.alias, runner)
+        end
+        local updated = { alias = conn.alias, dsn = trim(dsn), runner = runner or conn.runner }
+        prompt_schema_selection(updated, function()
+          notify("conexao '" .. conn.alias .. "' atualizada")
+        end)
       end)
     end)
   end)
@@ -718,11 +794,27 @@ function M.select(on_confirm)
         notify("nao foi possivel carregar a conexao '" .. choice.alias .. "'", vim.log.levels.ERROR)
         return
       end
-      prompt_schema_selection(conn, function(resolved)
-        if on_confirm then
-          on_confirm(resolved)
-        end
-      end)
+      -- Para MSSQL, oferece a opcao de escolher/confirmar o runner
+      -- (agora com URL-decoding corrigido para senhas com caracteres especiais)
+      if detect_driver(conn.dsn) == "mssql" then
+        prompt_runner_for_mssql(conn.alias, conn.dsn, function(runner)
+          if runner then
+            M.set_runner(conn.alias, runner)
+            conn.runner = runner
+          end
+          prompt_schema_selection(conn, function(resolved)
+            if on_confirm then
+              on_confirm(resolved)
+            end
+          end)
+        end)
+      else
+        prompt_schema_selection(conn, function(resolved)
+          if on_confirm then
+            on_confirm(resolved)
+          end
+        end)
+      end
       return
     end
 
