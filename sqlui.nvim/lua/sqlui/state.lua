@@ -16,6 +16,7 @@ local function persisted_defaults()
     aliases = {},
     history = {},
     last_connection_alias = nil,
+    connections_meta = {},
   }
 end
 
@@ -30,6 +31,9 @@ local function load_persisted()
   end
   if type(data.history) ~= "table" then
     data.history = {}
+  end
+  if type(data.connections_meta) ~= "table" then
+    data.connections_meta = {}
   end
 
   return data
@@ -108,6 +112,7 @@ function M.delete_alias(alias)
   if data.last_connection_alias == alias then
     data.last_connection_alias = nil
   end
+  data.connections_meta[alias] = nil
   save_persisted(data)
 end
 
@@ -121,6 +126,10 @@ function M.rename_alias(old_alias, new_alias)
   table.sort(data.aliases)
   if data.last_connection_alias == old_alias then
     data.last_connection_alias = new_alias
+  end
+  if data.connections_meta[old_alias] then
+    data.connections_meta[new_alias] = data.connections_meta[old_alias]
+    data.connections_meta[old_alias] = nil
   end
   save_persisted(data)
 end
@@ -149,6 +158,23 @@ function M.consume_visual_payload()
   local payload = M.visual_payload and vim.deepcopy(M.visual_payload) or nil
   M.visual_payload = nil
   return payload
+end
+
+--- Retrieve metadata for a named connection (e.g., runner choice).
+--- @param alias string
+--- @return table metadata (empty table if not found)
+function M.get_connection_meta(alias)
+  local data = load_persisted()
+  return vim.deepcopy(data.connections_meta[alias] or {})
+end
+
+--- Store metadata for a named connection.
+--- @param alias string
+--- @param meta table
+function M.set_connection_meta(alias, meta)
+  local data = load_persisted()
+  data.connections_meta[alias] = vim.deepcopy(meta or {})
+  save_persisted(data)
 end
 
 function M.reset_runtime()
