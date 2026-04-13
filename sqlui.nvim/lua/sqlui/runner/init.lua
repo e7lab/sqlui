@@ -18,6 +18,11 @@ local function usql_bin()
   return ((config.usql or {}).bin) or "usql"
 end
 
+local function sqlcmd_bin()
+  local config = state.get_config() or {}
+  return ((config.sqlcmd or {}).bin) or "sqlcmd"
+end
+
 local function history_limit()
   local config = state.get_config() or {}
   return ((config.history or {}).limit) or 20
@@ -29,6 +34,130 @@ local function ensure_dependency(bin, help)
   end
   notify(help or (bin .. " nao encontrado no PATH"), vim.log.levels.ERROR)
   return false
+end
+
+--- URL-decode uma string (converte %20 → espaço, %40 → @, etc)
+--- @param str string
+--- @return string
+local function url_decode(str)
+  if not str then return str end
+  str = str:gsub("+", " ")
+  str = str:gsub("%%([0-9a-fA-F][0-9a-fA-F])", function(hex)
+    return string.char(tonumber(hex, 16))
+  end)
+  return str
+end
+
+--- Parse a sqlserver:// or mssql:// DSN into its components.
+--- Handles optional port and strips query-string parameters.
+--- Returns nil when mandatory fields (host, db) cannot be extracted.
+--- @param dsn string
+--- @return table|nil  { host, port, db, user, pass, trusted }
+local function parse_mssql_dsn(dsn)
+  local rest = dsn:match("^%a[%w+%-%.]*://(.+)$")
+  if not rest then
+    return nil
+  end
+
+  local lower_rest = rest:lower()
+  local trusted = lower_rest:find("trusted_connection=yes")
+    or lower_rest:find("integrated%%20security=sspi")
+    or lower_rest:find("integrated security=sspi")
+
+  -- Strip query string before parsing structural parts
+  local without_qs = rest:match("^([^?]+)") or rest
+
+  -- user:pass@host:port/db
+  local user, pass, host, port, db =
+    without_qs:match("^([^:@]+):([^@]*)@([^:/]+):(%d+)/(.+)$")
+  -- user:pass@host/db
+  if not user then
+    user, pass, host, db =
+      without_qs:match("^([^:@]+):([^@]*)@([^/]+)/(.+)$")
+  end
+  -- host:port/db  (Windows Auth — no credentials in DSN)
+  if not host then
+    host, port, db = without_qs:match("^([^:/]+):(%d+)/(.+)$")
+  end
+  -- host/db
+  if not host then
+    host, db = without_qs:match("^([^/]+)/(.+)$")
+  end
+
+  if not host or not db then
+    return nil
+  end
+
+  -- URL-decode user e pass se presentes (podem ter %xx encoding)
+  if user then
+    user = url_decode(user)
+  end
+  if pass then
+    pass = url_decode(pass)
+  end
+
+  return {
+    host    = host,
+    port    = (port and port ~= "") and port or "1433",
+    db      = db,
+    user    = user,
+    pass    = pass,
+    trusted = trusted and true or false,
+  }
+end
+
+--- Execute a SQL file via sqlcmd and write stdout to output_path.
+--- Returns (ok: bool, raw_result: table) mirroring vim.system shape.
+--- @param conn table   connection object (needs .dsn)
+--- @param input_file string
+--- @param output_path string
+--- @return boolean, table
+local function execute_with_sqlcmd(conn, input_file, output_path)
+  if not ensure_dependency(sqlcmd_bin(), "sqlcmd nao encontrado. Instale via: brew install sqlcmd") then
+    return false, { code = 1, stdout = "", stderr = "sqlcmd nao encontrado no PATH" }
+  end
+
+  local p = parse_mssql_dsn(conn.dsn)
+  if not p then
+    -- Do NOT include DSN in messages; credentials live in the DSN.
+    -- Sanitize alias: strip control chars before logging.
+    local safe_alias = tostring(conn.alias or "?"):gsub("[%c]", "")
+    local err = "nao foi possivel parsear a DSN MSSQL para sqlcmd (alias: " .. safe_alias .. ")"
+    notify(err, vim.log.levels.ERROR)
+    return false, { code = 1, stdout = "", stderr = err }
+  end
+
+  -- sqlcmd server string: host  or  host,port
+  local server = p.port ~= "1433" and (p.host .. "," .. p.port) or p.host
+
+  local args = {
+    sqlcmd_bin(),
+    "-S", server,
+    "-d", p.db,
+    "-i", input_file,
+    "-o", output_path,
+    "-s", "|",  -- column separator (pipe)
+    "-W",       -- strip trailing whitespace from columns
+    "-b",       -- exit with non-zero code on SQL error
+  }
+
+  if p.trusted then
+    table.insert(args, "-E")
+  else
+    if p.user and p.user ~= "" then
+      vim.list_extend(args, { "-U", p.user })
+    end
+    -- Pass password via env var to avoid argv exposure in process list.
+    -- sqlcmd reads SQLCMDPASSWORD automatically; we never pass -P.
+  end
+
+  local env = {}
+  if not p.trusted and p.pass and p.pass ~= "" then
+    env.SQLCMDPASSWORD = p.pass
+  end
+
+  local result = vim.system(args, { text = true, env = env }):wait()
+  return result.code == 0, result
 end
 
 local function current_sql_file()
@@ -230,23 +359,195 @@ local function push_history(conn, payload, result_path)
   }, history_limit())
 end
 
+--- Allowed runner identifiers. Any unrecognised value falls back to "usql".
+local ALLOWED_RUNNERS = { usql = true, sqlcmd = true }
+
+--- Resolve the effective runner for a connection (allowlist, fail-closed).
+--- Reads from conn.runner first (set at load time from persisted meta),
+--- then falls back to "usql" for any unknown or empty value.
+--- @param conn table
+--- @return string  "usql" | "sqlcmd"
+local function resolve_runner(conn)
+  local r = trim(conn.runner or ""):lower()
+  return ALLOWED_RUNNERS[r] and r or "usql"
+end
+
+--- Converte output sqlcmd (pipe-separated) em Markdown table
+--- Trunca campos longos (> 50 chars) com '...' para manter legibilidade
+--- @param sqlcmd_output string
+--- @return string markdown table
+local function convert_sqlcmd_to_markdown_table(sqlcmd_output)
+  if not sqlcmd_output or sqlcmd_output == "" then
+    return sqlcmd_output
+  end
+
+  local lines = vim.split(sqlcmd_output, "\n", { plain = true })
+  if #lines < 2 then
+    return sqlcmd_output
+  end
+
+  local first_line = lines[1]
+  if not first_line:find("|") then
+    return sqlcmd_output
+  end
+
+  local function is_dash_separator(line)
+    local check_line = line:gsub("%|", ""):gsub("%s", "")
+    return check_line:match("^%-+$") ~= nil
+  end
+
+  local function extract_fields(line)
+    local fields = {}
+    for field in line:gmatch("([^|]+)") do
+      table.insert(fields, trim(field))
+    end
+    return fields
+  end
+
+  local function pad_field(field, width)
+    local field_trimmed = trim(field)
+    if #field_trimmed > width then
+      return field_trimmed:sub(1, width - 3) .. "..."
+    else
+      return field_trimmed .. string.rep(" ", width - #field_trimmed)
+    end
+  end
+
+  local headers = extract_fields(first_line)
+  local col_widths = {}
+  for i, header in ipairs(headers) do
+    col_widths[i] = #trim(header)
+  end
+
+  local data_lines = {}
+  for i = 2, #lines do
+    local line = lines[i]
+
+    if is_dash_separator(line) then
+      goto continue
+    end
+
+    if line:match("rows affected") or line:match("^%(%d+ rows?") then
+      goto continue
+    end
+
+    if line:find("|") then
+      local fields = extract_fields(line)
+      table.insert(data_lines, fields)
+      for j, field in ipairs(fields) do
+        if j <= #col_widths then
+          col_widths[j] = math.max(col_widths[j], #trim(field))
+        end
+      end
+    elseif trim(line) ~= "" then
+      table.insert(data_lines, line)
+    end
+
+    ::continue::
+  end
+
+  local result = {}
+
+  local header_parts = {}
+  for i, header in ipairs(headers) do
+    table.insert(header_parts, pad_field(header, col_widths[i]))
+  end
+  table.insert(result, "| " .. table.concat(header_parts, " | ") .. " |")
+
+  local separator_parts = {}
+  for i = 1, #headers do
+    table.insert(separator_parts, string.rep("-", col_widths[i]))
+  end
+  table.insert(result, "| " .. table.concat(separator_parts, " | ") .. " |")
+
+  for _, data in ipairs(data_lines) do
+    if type(data) == "table" then
+      local data_parts = {}
+      for i, field in ipairs(data) do
+        if i <= #col_widths then
+          table.insert(data_parts, pad_field(field, col_widths[i]))
+        end
+      end
+      table.insert(result, "| " .. table.concat(data_parts, " | ") .. " |")
+    else
+      table.insert(result, "\n" .. data)
+    end
+  end
+
+  return table.concat(result, "\n")
+end
+
+--- Core execution: dispatches to usql or sqlcmd based on connection runner.
+---
+--- DESIGN DECISIONS (aprovadas pelo mantenedor):
+---   1. output_path: o arquivo temporário de resultado é mantido em disco
+---      intencionalmente — ele é aberto como buffer read-only no Neovim para
+---      exibir os resultados ao usuário. O arquivo reside no diretório temp
+---      do OS (de propriedade do usuário atual) e é removido no reboot.
+---      Não registramos BufWipeout para deletá-lo; documentamos a semântica.
+---   2. vim.system():wait() síncrono: a execução bloqueia o loop principal
+---      do Neovim durante a query. Isso é consistente com todas as outras
+---      chamadas usql no arquivo e mantém o fluxo simples e previsível.
+---      Queries longas bloquearão o editor temporariamente — comportamento
+---      esperado e aceito.
+---
+--- temp_input é limpo em todos os caminhos via cleanup_temp().
+--- @param conn table
+--- @param payload table
+--- @return boolean
 local function execute_payload(conn, payload)
   local output_path = fs.tempname(".txt")
 
-  -- Use -f (file) instead of -c (command) so multi-statement batches
-  -- (BEGIN TRAN / COMMIT, GO separators, etc.) work correctly.
+  -- Para seleções visuais, materializa o SQL em arquivo temporário.
+  -- Ambos os runners aceitam caminho de arquivo; mantém o dispatch uniforme.
   local input_file = payload.sql_file
   local temp_input = nil
+
+  -- Guaranteed cleanup helper — called on every exit path.
+  local function cleanup_temp()
+    if temp_input then
+      pcall(fs.delete, temp_input)
+      temp_input = nil
+    end
+  end
+
   if payload.sql_text and payload.source_name and payload.source_name:match(":selection$") then
     temp_input = fs.tempname(".sql")
-    vim.fn.writefile(vim.split(payload.sql_text, "\n", { plain = true }), temp_input)
+    local write_ok = pcall(vim.fn.writefile, vim.split(payload.sql_text, "\n", { plain = true }), temp_input)
+    if not write_ok then
+      cleanup_temp()
+      notify("nao foi possivel escrever o arquivo SQL temporario", vim.log.levels.ERROR)
+      return false
+    end
     input_file = temp_input
   end
 
-  local result = vim.system({ usql_bin(), "-f", input_file, "-o", output_path, conn.dsn }, { text = true }):wait()
+  local runner = resolve_runner(conn)
+  local result
+  local ok_exec
 
-  if temp_input then
-    fs.delete(temp_input)
+  local dispatch_ok, dispatch_err = pcall(function()
+    if runner == "sqlcmd" then
+      ok_exec, result = execute_with_sqlcmd(conn, input_file, output_path)
+    else
+      -- usql: -f envia o arquivo diretamente; suporta múltiplos statements via GO
+      -- em drivers que o processam (postgres, mysql). Para MSSQL sem sqlcmd,
+      -- o usuário deve trocar o runner da conexão para "sqlcmd".
+      -- NOTA: vim.system():wait() é síncrono por decisão de design aprovada —
+      -- mantém o fluxo simples e consistente com as demais chamadas usql no arquivo.
+      result = vim.system(
+        { usql_bin(), "-f", input_file, "-o", output_path, conn.dsn },
+        { text = true }
+      ):wait()
+      ok_exec = result.code == 0
+    end
+  end)
+
+  cleanup_temp()
+
+  if not dispatch_ok then
+    notify("erro interno ao despachar consulta: " .. tostring(dispatch_err), vim.log.levels.ERROR)
+    return false
   end
 
   local content = ""
@@ -254,10 +555,10 @@ local function execute_payload(conn, payload)
     content = table.concat(vim.fn.readfile(output_path), "\n")
   end
 
-  if result.code ~= 0 then
-    local err = trim(result.stderr)
+  if not ok_exec then
+    local err = trim(result.stderr or "")
     if err == "" then
-      err = trim(result.stdout)
+      err = trim(result.stdout or "")
     end
     if err ~= "" then
       content = err
@@ -272,16 +573,25 @@ local function execute_payload(conn, payload)
 
   if trim(content) == "" then
     content = table.concat({
-      "Sem saida retornada pelo usql.",
+      "Sem saida retornada pelo " .. runner .. ".",
       "",
       "Arquivo: " .. payload.source_name,
       "Conexao: " .. conn.alias,
+      "Runner:  " .. runner,
       "Exit code: " .. tostring(result.code),
     }, "\n")
     vim.fn.writefile(vim.split(content, "\n", { plain = true }), output_path)
   end
 
-  open_result_file(output_path, "txt")
+  -- Se foi sqlcmd e o resultado tem pipes, converte para Markdown table
+  local filetype = "txt"
+  if runner == "sqlcmd" and content:find("|") then
+    local markdown_content = convert_sqlcmd_to_markdown_table(content)
+    vim.fn.writefile(vim.split(markdown_content, "\n", { plain = true }), output_path)
+    filetype = "markdown"
+  end
+
+  open_result_file(output_path, filetype)
   push_history(conn, payload, output_path)
   state.set_current_connection(conn)
   return true
@@ -296,6 +606,14 @@ end
 local function resolve_last_connection()
   local conn = state.get_last_connection()
   if conn and trim(conn.dsn) ~= "" then
+    -- Recarrega runner do metadata persistente para evitar objeto stale
+    -- (pode ter sido alterado desde que foi carregado na memória)
+    if conn.alias and trim(conn.alias) ~= "" then
+      local fresh_meta = state.get_connection_meta(conn.alias)
+      if fresh_meta.runner then
+        conn.runner = fresh_meta.runner
+      end
+    end
     return conn
   end
 
