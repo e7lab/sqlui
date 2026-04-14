@@ -284,8 +284,8 @@ end, { silent = true, desc = "Wrap lines with 'quotes' and trailing comma" })
 vim.keymap.set({ "n", "v" }, "<leader>\\", "<Esc>", { silent = true })
 
 -- Insert mode: only 'i' is allowed to enter insert mode
--- All other default insert-entry keys are disabled
-local insert_blocklist = { "I", "a", "A", "o", "O", "s", "S", "c", "C", "R", "gi" }
+-- r/R (replace mode) and O (new line above) are intentionally kept
+local insert_blocklist = { "I", "a", "A", "o", "s", "S", "c", "C", "gi" }
 for _, key in ipairs(insert_blocklist) do
   vim.keymap.set("n", key, "<Nop>", { silent = true, desc = "Blocked: use i to enter insert mode" })
 end
