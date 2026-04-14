@@ -13,10 +13,10 @@ vim.api.nvim_create_autocmd("ColorScheme", {
     vim.api.nvim_set_hl(0, "EndOfBuffer", { bg = "NONE" })
     vim.api.nvim_set_hl(0, "LineNr", { bg = "NONE", fg = "#d3d3d3" })
     vim.api.nvim_set_hl(0, "CursorLineNr", { bg = "NONE" })
-    -- Floats/popup menu: draw black + apply winblend/pumblend from options.
-    vim.api.nvim_set_hl(0, "NormalFloat", { bg = "black" })
-    vim.api.nvim_set_hl(0, "FloatBorder", { bg = "black" })
-    vim.api.nvim_set_hl(0, "Pmenu", { bg = "black" })
+    -- Floats/popup: solid dark bg so no document text bleeds through.
+    vim.api.nvim_set_hl(0, "NormalFloat", { bg = "#0d1117" })
+    vim.api.nvim_set_hl(0, "FloatBorder", { bg = "#0d1117", fg = "#30363d" })
+    vim.api.nvim_set_hl(0, "Pmenu", { bg = "#0d1117" })
 
     -- Telescope: solid background to prevent document bleed-through on re-open.
     local tel_bg = "#0d1117"

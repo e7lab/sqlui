@@ -5,18 +5,15 @@ vim.cmd("syntax on")
 -- Better colors in modern terminals + enables transparent backgrounds from colorschemes.
 vim.opt.termguicolors = true
 
--- Target opacity for UI elements that support blending.
--- Your terminal is at ~0.90 opacity; this keeps Neovim a bit LESS transparent.
-local ui_opacity = 0.93
+-- Transparency is provided by the terminal emulator, not by Neovim blending.
+-- winblend/pumblend > 0 cause ghost artifacts when Normal bg = NONE because
+-- Neovim has no solid colour to composite against.
+vim.opt.winblend = 0
+vim.opt.pumblend = 0
 
--- 0..100 (higher = more transparent) for floating UI (pum/floats).
--- Note: the main editor background in a terminal can't have per-app opacity.
-local blend = math.floor((1 - ui_opacity) * 100 + 0.5)
-vim.opt.winblend = blend
-vim.opt.pumblend = blend
-
--- If you're using Neovide, set black background with alpha.
+-- Neovide: use its own alpha channel instead of winblend.
 if vim.g.neovide then
+  local ui_opacity = 0.93
   local alpha = math.floor(ui_opacity * 255 + 0.5)
   vim.g.neovide_background_color = string.format("#000000%02X", alpha)
 end
