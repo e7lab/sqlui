@@ -441,10 +441,12 @@ return {
           sorting_strategy = "ascending",
           mappings = {
             i = {
+              ["<CR>"] = actions.select_tab_drop or actions.select_default,
               ["<C-PageUp>"] = actions.preview_scrolling_up,
               ["<C-PageDown>"] = actions.preview_scrolling_down,
             },
             n = {
+              ["<CR>"] = actions.select_tab_drop or actions.select_default,
               ["<C-PageUp>"] = actions.preview_scrolling_up,
               ["<C-PageDown>"] = actions.preview_scrolling_down,
             },
