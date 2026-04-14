@@ -399,6 +399,7 @@ return {
 
       require("telescope").setup({
         defaults = {
+          winblend = 0,
           layout_strategy = "horizontal",
           layout_config = {
             horizontal = {

@@ -18,6 +18,30 @@ vim.api.nvim_create_autocmd("ColorScheme", {
     vim.api.nvim_set_hl(0, "FloatBorder", { bg = "black" })
     vim.api.nvim_set_hl(0, "Pmenu", { bg = "black" })
 
+    -- Telescope: solid background to prevent document bleed-through on re-open.
+    local tel_bg = "#0d1117"
+    local tel_border_fg = "#30363d"
+    for _, grp in ipairs({
+      "TelescopeNormal",
+      "TelescopePromptNormal",
+      "TelescopeResultsNormal",
+      "TelescopePreviewNormal",
+    }) do
+      vim.api.nvim_set_hl(0, grp, { bg = tel_bg })
+    end
+    for _, grp in ipairs({
+      "TelescopeBorder",
+      "TelescopePromptBorder",
+      "TelescopeResultsBorder",
+      "TelescopePreviewBorder",
+    }) do
+      vim.api.nvim_set_hl(0, grp, { fg = tel_border_fg, bg = tel_bg })
+    end
+    vim.api.nvim_set_hl(0, "TelescopeTitle", { fg = "#89b4fa", bg = tel_bg, bold = true })
+    vim.api.nvim_set_hl(0, "TelescopePromptTitle", { fg = "#89b4fa", bg = tel_bg, bold = true })
+    vim.api.nvim_set_hl(0, "TelescopeResultsTitle", { fg = "#89b4fa", bg = tel_bg, bold = true })
+    vim.api.nvim_set_hl(0, "TelescopePreviewTitle", { fg = "#89b4fa", bg = tel_bg, bold = true })
+
     vim.api.nvim_set_hl(0, "TabLineSel", { bg = "#808080", fg = "black", bold = true })
     vim.api.nvim_set_hl(0, "TabLine", { bg = "NONE", fg = "white" })
     vim.api.nvim_set_hl(0, "TabLineFill", { bg = "NONE" })
