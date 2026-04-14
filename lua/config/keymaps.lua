@@ -282,3 +282,10 @@ end, { silent = true, desc = "Wrap lines with 'quotes' and trailing comma" })
 
 -- Leader + backslash to escape
 vim.keymap.set({ "n", "v" }, "<leader>\\", "<Esc>", { silent = true })
+
+-- Insert mode: only 'i' is allowed to enter insert mode
+-- All other default insert-entry keys are disabled
+local insert_blocklist = { "I", "a", "A", "o", "O", "s", "S", "c", "C", "R", "gi" }
+for _, key in ipairs(insert_blocklist) do
+  vim.keymap.set("n", key, "<Nop>", { silent = true, desc = "Blocked: use i to enter insert mode" })
+end
