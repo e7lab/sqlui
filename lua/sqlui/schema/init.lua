@@ -952,11 +952,73 @@ end
 -- ============================================================
 
 local function generate_alter_procedure_sql(driver, schema, name, new_definition, original_type)
-  -- Generate the appropriate ALTER/CREATE OR REPLACE statement based on driver
-  -- For now, return the definition as-is (driver will parse it)
-  -- In future, can add driver-specific SQL generation
-  return new_definition
+  -- Phase 2: Driver-specific SQL generation
+  local def = trim(new_definition or "")
+  
+  if def == "" then
+    return nil
+  end
+  
+  if driver == "postgres" then
+    -- PostgreSQL: CREATE OR REPLACE FUNCTION works for updates
+    -- Just use the definition as-is
+    return def
+  
+  elseif driver == "mysql" then
+    -- MySQL: Need to handle DELIMITER and ALTER PROCEDURE/FUNCTION
+    -- Try to detect if it's already wrapped
+    local upper_def = def:upper()
+    if upper_def:find("^DELIMITER") then
+      -- Already has DELIMITER handling, use as-is
+      return def
+    elseif upper_def:find("^ALTER%s+PROCEDURE") or upper_def:find("^ALTER%s+FUNCTION") then
+      -- Already ALTER, use as-is
+      return def
+    elseif upper_def:find("^CREATE%s+PROCEDURE") or upper_def:find("^CREATE%s+FUNCTION") then
+      -- Has CREATE, wrap with DELIMITER and convert to ALTER
+      local proc_type = upper_def:find("^CREATE%s+PROCEDURE") and "PROCEDURE" or "FUNCTION"
+      local quoted_schema = "`" .. schema:gsub("`", "``") .. "`"
+      local quoted_name = "`" .. name:gsub("`", "``") .. "`"
+      
+      -- Extract body (everything after the signature)
+      local body_start = def:find("BEGIN") or def:find("^%s*CREATE")
+      if body_start then
+        return string.format(
+          "DELIMITER $$\nALTER %s %s.%s\n%s\n$$\nDELIMITER ;",
+          proc_type,
+          quoted_schema,
+          quoted_name,
+          def:sub(body_start)
+        )
+      end
+    end
+    -- Fallback: return as-is
+    return def
+  
+  elseif driver == "mssql" then
+    -- MSSQL: ALTER PROCEDURE [schema].[name] AS BEGIN ... END
+    local upper_def = def:upper()
+    
+    if upper_def:find("^ALTER%s+PROCEDURE") then
+      -- Already ALTER, use as-is
+      return def
+    elseif upper_def:find("^CREATE%s+PROCEDURE") then
+      -- Replace CREATE with ALTER
+      local altered = def:gsub("^%s*[Cc][Rr][Ee][Aa][Tt][Ee]%s+[Pp][Rr][Oo][Cc][Ee][Dd][Uu][Rr][Ee]", "ALTER PROCEDURE")
+      return altered
+    else
+      -- Wrap in ALTER statement
+      local quoted_schema = "[" .. schema:gsub("]", "]]") .. "]"
+      local quoted_name = "[" .. name:gsub("]", "]]") .. "]"
+      return string.format("ALTER PROCEDURE %s.%s\nAS\n%s", quoted_schema, quoted_name, def)
+    end
+  
+  else
+    -- Unknown driver: return as-is and hope for best
+    return def
+  end
 end
+
 
 local function save_procedure_definition(buf)
   -- Retrieve stored metadata from buffer
