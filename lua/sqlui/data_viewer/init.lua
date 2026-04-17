@@ -113,27 +113,40 @@ order by kcu.ORDINAL_POSITION]],
 end
 
 local function discover_columns(conn, schema_name, object_name)
-  local driver = driver_from_dsn(conn.dsn)
-  local rows, err = run_usql_json(conn, column_query(driver, schema_name, object_name))
-  if not rows then
-    return nil, err
+  if not conn or not conn.rpc_id then
+    return nil, "conexao nao aberta via RPC"
+  end
+  
+  local result_data = nil
+  local result_err = nil
+  local done = false
+
+  -- Phase 5: Use RPC async (synchronized with vim.wait)
+  rpc.columns(conn.rpc_id, schema_name, object_name, function(result, err)
+    if err then
+      result_err = err
+    else
+      result_data = result
+    end
+    done = true
+  end)
+
+  -- Wait for RPC callback (up to 5s)
+  vim.wait(5000, function()
+    return done
+  end)
+
+  if not done or result_err then
+    return nil, result_err or "timeout ao buscar colunas"
   end
 
   local columns = {}
-  if driver == "sqlite" then
-    for _, row in ipairs(rows) do
+  if result_data then
+    for _, col in ipairs(result_data) do
       table.insert(columns, {
-        name = row.name or row.NAME,
-        data_type = row.type or row.TYPE or "TEXT",
-        ordinal = row.cid or row.CID,
-      })
-    end
-  else
-    for _, row in ipairs(rows) do
-      table.insert(columns, {
-        name = row.COLUMN_NAME or row.column_name,
-        data_type = row.DATA_TYPE or row.data_type,
-        ordinal = row.ORDINAL_POSITION or row.ordinal_position,
+        name = col.name,
+        data_type = col.type or "UNKNOWN",
+        ordinal = col.ordinal_position or 0,
       })
     end
   end
@@ -141,24 +154,30 @@ local function discover_columns(conn, schema_name, object_name)
 end
 
 local function discover_primary_key(conn, schema_name, object_name)
-  local driver = driver_from_dsn(conn.dsn)
-  local rows = run_usql_json(conn, primary_key_query(driver, schema_name, object_name))
-  if type(rows) ~= "table" then
+  if not conn or not conn.rpc_id then
     return {}
   end
+  
+  local result_data = nil
+  local done = false
+
+  -- Phase 5: Use RPC async (synchronized with vim.wait)
+  rpc.primary_key(conn.rpc_id, schema_name, object_name, function(result, err)
+    if not err and result then
+      result_data = result
+    end
+    done = true
+  end)
+
+  -- Wait for RPC callback (up to 5s)
+  vim.wait(5000, function()
+    return done
+  end)
 
   local columns = {}
-  if driver == "sqlite" then
-    -- PRAGMA table_info returns all columns; filter where pk > 0
-    for _, row in ipairs(rows) do
-      local pk = tonumber(row.pk or row.PK or 0) or 0
-      if pk > 0 then
-        table.insert(columns, row.name or row.NAME)
-      end
-    end
-  else
-    for _, row in ipairs(rows) do
-      table.insert(columns, row.COLUMN_NAME or row.column_name)
+  if result_data and type(result_data) == "table" then
+    for _, col_name in ipairs(result_data) do
+      table.insert(columns, col_name)
     end
   end
   return columns
@@ -283,11 +302,34 @@ local function fetch_page(ctx)
     return nil, nil, err
   end
 
-  local rows, query_err = run_usql_json(ctx.conn, sql)
-  if not rows then
-    return nil, nil, query_err
+  if not ctx.conn or not ctx.conn.rpc_id then
+    return nil, nil, "conexao nao aberta via RPC"
   end
 
+  local result_rows = nil
+  local result_err = nil
+  local done = false
+
+  -- Phase 5: Use RPC async for data fetching (synchronized with vim.wait)
+  rpc.execute(ctx.conn.rpc_id, sql, function(result, err)
+    if err then
+      result_err = err
+    else
+      result_rows = result and result.rows or {}
+    end
+    done = true
+  end)
+
+  -- Wait for RPC callback (up to 5s)
+  vim.wait(5000, function()
+    return done
+  end)
+
+  if not done or result_err then
+    return nil, nil, result_err or "timeout ao buscar dados"
+  end
+
+  local rows = result_rows or {}
   local has_next = #rows > ctx.page_size
   while #rows > ctx.page_size do
     table.remove(rows)
@@ -693,9 +735,6 @@ local function open_viewer(ctx)
 end
 
 function M.open_for_item(conn, item)
-  if not ensure_dependency(usql_bin(), "usql nao encontrado no PATH") then
-    return
-  end
   if not item or not item.schema or not item.name then
     notify("objeto SQL invalido para visualizacao", vim.log.levels.ERROR)
     return
@@ -725,10 +764,7 @@ function M.open_for_item(conn, item)
 end
 
 function M.view(target)
-  if not ensure_dependency(usql_bin(), "usql nao encontrado no PATH") then
-    return
-  end
-
+  -- Phase 5: Connection selection via RPC (no CLI dependency)
   local function with_conn(conn)
     local schema_name, object_name = split_target(target)
     if schema_name and object_name then
