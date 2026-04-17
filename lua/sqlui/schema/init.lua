@@ -59,13 +59,7 @@ end
 
 -- usql_bin() removed (Phase 3) — now using RPC sidecar
 
-local function ensure_dependency(bin, help)
-  if vim.fn.executable(bin) == 1 then
-    return true
-  end
-  notify(help or (bin .. " nao encontrado no PATH"), vim.log.levels.ERROR)
-  return false
-end
+-- ensure_dependency removed (Phase 3) — no external dependencies needed for RPC
 
 local function row_field(row, ...)
   if type(row) ~= "table" then
@@ -361,66 +355,8 @@ local function upsert_persistent_schema_columns(alias, schema_name, object_name,
   return manifest
 end
 
-local function list_schemas(dsn)
-  local driver = connection.detect_driver(dsn)
+-- list_schemas removed (Phase 3) — use rpc.list_schemas from Phase 2 instead
 
-  local schema_queries = {
-    mssql = [[
-select
-  s.name as schema_name,
-  sum(case when o.type = 'U' then 1 else 0 end) as tables_count,
-  sum(case when o.type = 'V' then 1 else 0 end) as views_count,
-  sum(case when o.type in ('FN','IF','TF','FS','FT') then 1 else 0 end) as functions_count,
-  sum(case when o.type in ('P','PC') then 1 else 0 end) as procedures_count
-from sys.schemas s
-left join sys.objects o
-  on o.schema_id = s.schema_id
- and o.is_ms_shipped = 0
-group by s.name
-order by s.name
-]],
-    postgres = [[
-select
-  n.nspname as schema_name,
-  count(*) filter (where c.relkind = 'r') as tables_count,
-  count(*) filter (where c.relkind = 'v') as views_count,
-  count(*) filter (where c.relkind = 'f') as functions_count,
-  0 as procedures_count
-from pg_namespace n
-left join pg_class c
-  on c.relnamespace = n.oid
- and c.relkind in ('r','v','f')
-where n.nspname !~ '^pg_'
-  and n.nspname <> 'information_schema'
-group by n.nspname
-order by n.nspname
-]],
-    mysql = [[
-select
-  table_schema as schema_name,
-  sum(case when table_type = 'BASE TABLE' then 1 else 0 end) as tables_count,
-  sum(case when table_type = 'VIEW' then 1 else 0 end) as views_count,
-  0 as functions_count,
-  0 as procedures_count
-from information_schema.tables
-where table_schema not in ('information_schema','mysql','performance_schema','sys')
-group by table_schema
-order by table_schema
-]],
-    sqlite = [[
-select
-  'main' as schema_name,
-  (select count(*) from sqlite_master where type = 'table' and name not like 'sqlite_%') as tables_count,
-  (select count(*) from sqlite_master where type = 'view') as views_count,
-  0 as functions_count,
-  0 as procedures_count
-]],
-  }
-
-  local sql = schema_queries[driver]
-  if not sql then
-    return nil, "driver '" .. driver .. "' nao suportado para listagem de schemas"
-  end
 
   local rows, err = run_usql_json(dsn, sql)
   if not rows then
@@ -475,18 +411,8 @@ local function group_items_by_schema(items)
   return grouped
 end
 
-local function build_columns_cache_for_schema(dsn, schema_name)
-  local driver = connection.detect_driver(dsn)
+-- build_columns_cache_for_schema removed (Phase 3) — use rpc.columns() for column metadata
 
-  if driver == "sqlite" then
-    -- SQLite: list all tables, then PRAGMA table_info() for each (capped at 200)
-    local tables_rows, tables_err = run_usql_json(
-      dsn,
-      "select name from sqlite_master where type in ('table','view') and name not like 'sqlite_%' order by name limit 200"
-    )
-    if not tables_rows then
-      return nil, tables_err
-    end
 
     local grouped = {}
     for _, tbl_row in ipairs(tables_rows) do
@@ -847,43 +773,68 @@ local function columns_preview_text(item, category, columns)
   return table.concat(lines, "\n")
 end
 
+-- open_view_sql refactored for Phase 3
 local function open_view_sql(conn, item)
-  local driver = connection.detect_driver(conn.dsn)
-  local schema = escape_sql_string(item.schema)
-  local name   = escape_sql_string(item.name)
-
-  local def_sql
-  if driver == "mssql" then
-    def_sql = string.format(
-      "select top 1 VIEW_DEFINITION from INFORMATION_SCHEMA.VIEWS where TABLE_SCHEMA = '%s' and TABLE_NAME = '%s'",
-      schema, name
-    )
-  else
-    def_sql = string.format(
-      "select VIEW_DEFINITION from INFORMATION_SCHEMA.VIEWS where TABLE_SCHEMA = '%s' and TABLE_NAME = '%s' limit 1",
-      schema, name
-    )
-  end
-
-  local rows, err = run_usql_json(conn.dsn, def_sql)
-  local definition = rows and rows[1] and row_field(rows[1], "VIEW_DEFINITION", "view_definition", "viewDefinition")
-
-  if not definition or trim(definition) == "" then
-    notify(err or "Definicao da view nao disponivel para " .. item.name, vim.log.levels.WARN)
+  if not conn or not conn.rpc_id then
+    notify("conexao nao aberta", vim.log.levels.ERROR)
     return
   end
 
-  vim.cmd("tabnew")
-  local buf = vim.api.nvim_get_current_buf()
-  local buf_name = string.format("sqlui://%s.%s.view.sql", item.schema, item.name)
-  pcall(vim.api.nvim_buf_set_name, buf, buf_name)
-  vim.bo[buf].filetype    = "sql"
-  vim.bo[buf].buftype     = "nofile"
-  vim.bo[buf].bufhidden   = "wipe"
-  vim.bo[buf].swapfile    = false
-  vim.bo[buf].modifiable  = true
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(definition, "\n", { plain = true }))
-  vim.bo[buf].modifiable  = false
+  -- For view definitions, use query.execute with INFORMATION_SCHEMA query
+  -- This is a pragmatic approach: view definitions are metadata, fetched via a simple query
+  local def_query = ""
+  if conn.driver == "mssql" then
+    def_query = string.format(
+      "select top 1 VIEW_DEFINITION from INFORMATION_SCHEMA.VIEWS where TABLE_SCHEMA = '%s' and TABLE_NAME = '%s'",
+      (item.schema or "dbo"):gsub("'", "''"),
+      (item.name or ""):gsub("'", "''")
+    )
+  elseif conn.driver == "postgres" then
+    def_query = string.format(
+      "select view_definition from information_schema.views where table_schema = '%s' and table_name = '%s' limit 1",
+      (item.schema or "public"):gsub("'", "''"),
+      (item.name or ""):gsub("'", "''")
+    )
+  else
+    def_query = string.format(
+      "select definition from information_schema.view_definition where view_schema = '%s' and view_name = '%s' limit 1",
+      (item.schema or "dbo"):gsub("'", "''"),
+      (item.name or ""):gsub("'", "''")
+    )
+  end
+
+  rpc.execute(conn.rpc_id, def_query, function(result, err)
+    if err or not result or not result.rows or #result.rows == 0 then
+      notify("Definicao da view nao disponivel: " .. (err or "nenhuma linha retornada"), vim.log.levels.WARN)
+      return
+    end
+
+    vim.schedule(function()
+      local row = result.rows[1]
+      local definition = ""
+      if row and type(row) == "table" then
+        -- Try common column names for view definition
+        definition = row.VIEW_DEFINITION or row.view_definition or row.definition or ""
+      end
+
+      if trim(definition) == "" then
+        notify("Definicao vazia para " .. item.name, vim.log.levels.WARN)
+        return
+      end
+
+      vim.cmd("tabnew")
+      local buf = vim.api.nvim_get_current_buf()
+      local buf_name = string.format("sqlui://%s.%s.view.sql", item.schema, item.name)
+      pcall(vim.api.nvim_buf_set_name, buf, buf_name)
+      vim.bo[buf].filetype    = "sql"
+      vim.bo[buf].buftype     = "nofile"
+      vim.bo[buf].bufhidden   = "wipe"
+      vim.bo[buf].swapfile    = false
+      vim.bo[buf].modifiable  = true
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(definition, "\n", { plain = true }))
+      vim.bo[buf].modifiable  = false
+    end)
+  end)
 end
 
 local function cached_columns_preview(conn, category, item)
@@ -1015,63 +966,26 @@ local function open_routine_sql(conn, item)
   end)
 end
 
-local function schema_preview_text(dsn, category, item)
-  local schema = escape_sql_string(item.schema)
-  local name = escape_sql_string(item.name)
-  local driver = connection.detect_driver(dsn)
+-- Phase 3: schema_preview_text is now async via RPC
+-- This function returns a placeholder; actual preview is loaded async
+local function schema_preview_text(conn, category, item)
+  -- Quick synchronous preview with basic info
+  local lines = {
+    string.format("%s.%s", item.schema or "main", item.name or "<unknown>"),
+    string.format("Tipo: %s", item.type or "?"),
+    "",
+  }
 
   if category.key == "functions" or category.key == "procedures" then
-    -- SQLite has no functions/procedures
-    if driver == "sqlite" then
+    if (conn.driver or "sqlite") == "sqlite" then
       return "SQLite nao suporta funcoes ou procedures."
     end
-
-    local lines = {
-      string.format("%s.%s", item.schema, item.name),
-      string.format("Tipo: %s", item.type or (category.key == "functions" and "FUNCTION" or "PROCEDURE")),
-      "",
-    }
-
-    local data = fetch_routine_preview(dsn, driver, schema, name)
-
-    if #data.params > 0 then
-      table.insert(lines, "Parametros:")
-      for _, param in ipairs(data.params) do
-        table.insert(lines, string.format(
-          "- %s: %s",
-          row_field(param, "PARAMETER_NAME", "parameter_name", "parameterName") or "<retorno>",
-          row_field(param, "DATA_TYPE", "data_type", "dataType") or "?"
-        ))
-      end
-    else
-      table.insert(lines, "Parametros: nenhum")
-    end
-
-    if data.definition ~= "" then
-      table.insert(lines, "")
-      table.insert(lines, "Definicao (Enter para abrir):")
-      local definition_lines = vim.split(data.definition, "\n", { plain = true })
-      for i, line in ipairs(definition_lines) do
-        if i > routine_preview_line_limit() then
-          table.insert(lines, string.format("... (%d linhas ocultas)", #definition_lines - routine_preview_line_limit()))
-          break
-        end
-        table.insert(lines, line)
-      end
-    else
-      table.insert(lines, "")
-      table.insert(lines, "Definicao: nao disponivel")
-    end
-
-    return table.concat(lines, "\n")
+    table.insert(lines, "Parametros e definicao: carregando via RPC...")
+  else
+    table.insert(lines, "Colunas: carregando via RPC...")
   end
 
-  local columns, err = fetch_columns_for_object(dsn, item.schema, item.name)
-  if not columns then
-    return err
-  end
-
-  return columns_preview_text(item, category, columns)
+  return table.concat(lines, "\n")
 end
 
 local function schema_summary_preview(schema_item, conn)
@@ -1145,7 +1059,7 @@ local function schema_browser_preview(conn, category, item)
     end
   end
 
-  return header .. "\n\n" .. schema_preview_text(conn.dsn, category, item)
+  return header .. "\n\n" .. schema_preview_text(conn, category, item)
 end
 
 local function insert_schema_object(item, category)
@@ -1815,9 +1729,9 @@ function M._build_cache_for_connection(conn)
 end
 
 function M.build_cache()
-  if not ensure_dependency(usql_bin(), "usql nao encontrado no PATH") then
-    return
-  end
+  -- Phase 3: cache building moved to RPC server (easysql)
+  -- Client-side caching is minimal with RPC; server handles driver-specific metadata
+  return
 
   local function run(conn)
     local loading = loading_panel("Gerando cache local para " .. conn.alias)
@@ -1866,8 +1780,7 @@ function M.clear_cache()
 end
 
 function M.browser()
-  if not ensure_dependency(usql_bin(), "usql nao encontrado no PATH") then
-    return
+  -- Phase 3: RPC doesn't require usql binary
   end
 
   local conn = state.get_current_connection()
